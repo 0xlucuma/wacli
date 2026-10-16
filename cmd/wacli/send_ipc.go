@@ -315,9 +315,9 @@ func handleSendDelegateConn(ctx context.Context, conn net.Conn, execute sendDele
 		_ = json.NewEncoder(conn).Encode(resp)
 		return
 	}
-	if req.Kind == chatStateKind {
-		// App-state writes are serialized by the app and can wait minutes on
-		// recovery, so they must not hold the send queue.
+	if req.Kind == chatStateKind || req.Kind == stickersRefreshKind {
+		// App-state writes and replays are serialized by the app and can wait
+		// minutes on recovery, so they must not hold the send queue.
 		if requestCtx.Err() != nil {
 			_ = json.NewEncoder(conn).Encode(sendDelegateResponse{OK: false, Error: "request deadline passed before dispatch; it was not sent"})
 			return
@@ -444,6 +444,8 @@ func executeDelegatedSend(parent context.Context, a *app.App, req sendDelegateRe
 		return executeDelegatedContactsCheck(ctx, a.WA(), req)
 	case chatStateKind:
 		return executeDelegatedChatState(ctx, a, req)
+	case stickersRefreshKind:
+		return executeDelegatedStickersRefresh(ctx, a)
 	default:
 		return sendDelegateResponse{}, fmt.Errorf("unsupported send kind %q", req.Kind)
 	}
