@@ -268,25 +268,43 @@ func (a *App) syncAppStateDeltas(ctx context.Context, recoveries *sync.Map) {
 	// (its event backlog, or the pause of a shutdown), and what it owes then
 	// lives in memory. For the collections above the fetches above make up
 	// for it after a restart; for the two critical ones nothing did until
-	// their next notification. Catch them up here, incrementally, and only
-	// where the SDK has a cursor: without one a fetch would be a full sync,
-	// which belongs to the initial sync after the key share. The captured
-	// fetch reports a failure without starting a recovery, so a collection
-	// whose full sync is known broken is never sent through a full replay.
+	// their next notification. Catch them up here as well, so that every
+	// collection is caught up by every start.
+	//
+	// With a cursor: the captured incremental fetch, which reports a failure
+	// without starting a recovery. Without one the collection never synced,
+	// and the fetch is the SDK's own first sync, as after a key share
+	// (onlyIfNotSynced: it asks nothing if that sync happened meanwhile). A
+	// first sync is a full sync, so it is not attempted where the full sync
+	// is known broken, and its failure takes the usual way: the SDK reports
+	// it to the sync handler, which recovers a collection once per sync.
 	for _, name := range []appstate.WAPatchName{appstate.WAPatchCriticalBlock, appstate.WAPatchCriticalUnblockLow} {
 		if _, recovering := recoveries.Load(string(name)); recovering {
 			continue
 		}
 		synced, err := a.wa.HasLocalAppState(ctx, string(name))
-		if err == nil {
-			if !synced {
-				continue
-			}
+		switch {
+		case err != nil:
+		case synced:
 			fetchErr, persistErr := a.fetchAndPersistAppState(ctx, name, false, &appStatePersistenceTracker{})
 			if persistErr == nil && transientAppStateFetch(fetchErr) {
 				continue
 			}
 			err = errors.Join(fetchErr, persistErr)
+		case a.isAppStateFullSyncBroken(name):
+			a.emitWarning("app_state_first_sync_skipped",
+				fmt.Sprintf("warning: WhatsApp app state %s has never synced and its full sync is known broken; not syncing it at start", name),
+				map[string]any{"name": string(name)})
+			continue
+		default:
+			err = a.wa.FetchAppState(ctx, string(name), false, true)
+			if transientAppStateFetch(err) {
+				continue
+			}
+			if errors.Is(err, wa.ErrEmptyAppStateKeyShare) {
+				a.handleAppStateSyncError(ctx, &events.AppStateSyncError{Name: name, FullSync: true, Error: err}, recoveries)
+				continue
+			}
 		}
 		if err != nil {
 			a.emitWarning("app_state_sync_failed",

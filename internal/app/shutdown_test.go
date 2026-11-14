@@ -18,6 +18,7 @@ import (
 	"go.mau.fi/whatsmeow/appstate"
 	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/proto/waSyncAction"
+	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	"google.golang.org/protobuf/proto"
 )
@@ -443,27 +444,48 @@ func TestAbandonedReplayRecordStillCounts(t *testing.T) {
 }
 
 // cursorWA is a client whose SDK has a cursor for some collections only.
+// firstSync stands for the server's answer to the first sync of the others.
 type cursorWA struct {
 	*fakeWA
-	cursors map[string]bool
-	failing error
+	cursors   map[string]bool
+	failing   error
+	firstSync func(name string) error
 }
 
 func (w *cursorWA) HasLocalAppState(_ context.Context, name string) (bool, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	return w.cursors[name], w.failing
+}
+
+func (w *cursorWA) FetchAppState(ctx context.Context, name string, fullSync, onlyIfNotSynced bool) error {
+	if err := w.fakeWA.FetchAppState(ctx, name, fullSync, onlyIfNotSynced); err != nil || !onlyIfNotSynced {
+		return err
+	}
+	w.mu.Lock()
+	synced := w.cursors[name]
+	w.mu.Unlock()
+	if synced || w.firstSync == nil {
+		return nil
+	}
+	return w.firstSync(name)
 }
 
 // The start catches up the two critical collections as well, because a
 // notification the SDK consumed and refused before the restart is otherwise
-// forgotten: incrementally, where the SDK has a cursor, and never with a
-// full replay. A failure is reported and the start goes on.
+// forgotten. With a cursor: incrementally, never with a full replay. Without
+// one: the SDK's own first sync, unless the full sync is known broken. A
+// failure is reported and the start goes on.
 func TestStartCatchesUpCriticalCollections(t *testing.T) {
 	critical := []string{"critical_block", "critical_unblock_low"}
-	start := func(t *testing.T, cursors map[string]bool, prepare func(*App, *cursorWA)) (*cursorWA, map[string]map[string]any) {
+	start := func(t *testing.T, cursors map[string]bool, prepare func(*App, *cursorWA)) (*App, *cursorWA, map[string]map[string]any) {
 		t.Helper()
 		a := newTestApp(t)
 		log := &lockedBuffer{}
 		a.opts.Events = out.NewEventWriter(log, true)
+		if cursors == nil {
+			cursors = map[string]bool{}
+		}
 		w := &cursorWA{fakeWA: newFakeWA(), cursors: cursors}
 		a.wa = w
 		if prepare != nil {
@@ -473,9 +495,14 @@ func TestStartCatchesUpCriticalCollections(t *testing.T) {
 			t.Fatalf("the start was aborted: %v", err)
 		}
 		a.appStateRecoveryWorkers.Wait()
-		return w, lifecycleWarnings(t, log)
+		if err := a.appStatePersist.waitIdle(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		return a, w, lifecycleWarnings(t, log)
 	}
-	fetches := func(w *cursorWA, name string) (incremental, full int) {
+	// fetches counts what the start asked for a collection: incremental
+	// fetches, first syncs (onlyIfNotSynced) and full replays.
+	fetches := func(w *cursorWA, name string) (incremental, first, full int) {
 		w.mu.Lock()
 		defer w.mu.Unlock()
 		for _, fetch := range w.appStateFetches {
@@ -483,48 +510,41 @@ func TestStartCatchesUpCriticalCollections(t *testing.T) {
 			case fetch.name != name:
 			case fetch.fullSync:
 				full++
+			case fetch.onlyIfNotSynced:
+				first++
 			default:
 				incremental++
 			}
 		}
-		return incremental, full
+		return incremental, first, full
 	}
+	both := func() map[string]bool { return map[string]bool{"critical_block": true, "critical_unblock_low": true} }
 
 	t.Run("with a cursor", func(t *testing.T) {
-		w, warnings := start(t, map[string]bool{"critical_block": true, "critical_unblock_low": true}, nil)
+		_, w, warnings := start(t, both(), nil)
 		for _, name := range critical {
-			if incremental, full := fetches(w, name); incremental != 1 || full != 0 {
-				t.Fatalf("%s: %d incremental and %d full fetches", name, incremental, full)
+			if incremental, first, full := fetches(w, name); incremental != 1 || first+full != 0 {
+				t.Fatalf("%s: %d incremental fetches, %d first syncs, %d full replays", name, incremental, first, full)
 			}
 		}
 		if warnings["app_state_sync_failed"] != nil {
 			t.Fatalf("warning: %v", warnings["app_state_sync_failed"])
 		}
 	})
-	t.Run("without a cursor", func(t *testing.T) {
-		// Never synced: a fetch would be a full sync. Left to the key share.
-		w, _ := start(t, map[string]bool{"critical_block": true}, nil)
-		if incremental, full := fetches(w, "critical_unblock_low"); incremental+full != 0 {
-			t.Fatalf("critical_unblock_low without a cursor: %d incremental and %d full fetches", incremental, full)
-		}
-		if incremental, full := fetches(w, "critical_block"); incremental != 1 || full != 0 {
-			t.Fatalf("critical_block: %d incremental and %d full fetches", incremental, full)
-		}
-	})
 	t.Run("replay already requested", func(t *testing.T) {
 		// The replay request owns the collection: no second fetch for it.
-		w, _ := start(t, map[string]bool{"critical_block": true, "critical_unblock_low": true}, func(a *App, _ *cursorWA) {
+		_, w, _ := start(t, both(), func(a *App, _ *cursorWA) {
 			if err := a.db.MarkAppStateRecoveryRequired("critical_block"); err != nil {
 				t.Fatal(err)
 			}
 		})
-		if incremental, full := fetches(w, "critical_block"); incremental != 0 || full != 1 {
-			t.Fatalf("critical_block with a replay request: %d incremental and %d full fetches", incremental, full)
+		if incremental, first, full := fetches(w, "critical_block"); incremental+first != 0 || full != 1 {
+			t.Fatalf("critical_block with a replay request: %d incremental fetches, %d first syncs, %d full replays", incremental, first, full)
 		}
 	})
 	for _, broken := range []bool{false, true} {
-		t.Run(fmt.Sprintf("fetch fails, full sync known broken=%v", broken), func(t *testing.T) {
-			w, warnings := start(t, map[string]bool{"critical_block": true, "critical_unblock_low": true}, func(a *App, w *cursorWA) {
+		t.Run(fmt.Sprintf("with a cursor, fetch fails, full sync known broken=%v", broken), func(t *testing.T) {
+			_, w, warnings := start(t, both(), func(a *App, w *cursorWA) {
 				if broken {
 					for _, name := range critical {
 						if err := a.db.SetAppStateFullSyncBroken(name, true); err != nil {
@@ -537,8 +557,8 @@ func TestStartCatchesUpCriticalCollections(t *testing.T) {
 				w.appStateFetchErrs = []error{nil, nil, nil, appstate.ErrMismatchingLTHash, appstate.ErrMismatchingLTHash}
 			})
 			for _, name := range critical {
-				if incremental, full := fetches(w, name); incremental != 1 || full != 0 {
-					t.Fatalf("%s: %d incremental and %d full fetches after a failed catch-up", name, incremental, full)
+				if incremental, first, full := fetches(w, name); incremental != 1 || first+full != 0 {
+					t.Fatalf("%s: %d incremental fetches, %d first syncs, %d full replays after a failed catch-up", name, incremental, first, full)
 				}
 			}
 			w.mu.Lock()
@@ -551,9 +571,76 @@ func TestStartCatchesUpCriticalCollections(t *testing.T) {
 		})
 	}
 	t.Run("cursor cannot be read", func(t *testing.T) {
-		w, warnings := start(t, nil, func(_ *App, w *cursorWA) { w.failing = errors.New("session store unavailable") })
-		if incremental, full := fetches(w, "critical_block"); incremental+full != 0 || warnings["app_state_sync_failed"]["error"] != "session store unavailable" {
-			t.Fatalf("fetches=%d warning=%v", incremental+full, warnings["app_state_sync_failed"])
+		_, w, warnings := start(t, nil, func(_ *App, w *cursorWA) { w.failing = errors.New("session store unavailable") })
+		if incremental, first, full := fetches(w, "critical_block"); incremental+first+full != 0 || warnings["app_state_sync_failed"]["error"] != "session store unavailable" {
+			t.Fatalf("fetches=%d warning=%v", incremental+first+full, warnings["app_state_sync_failed"])
+		}
+	})
+
+	contact := types.NewJID("15550000009", types.DefaultUserServer)
+	t.Run("never synced, the server has the collection", func(t *testing.T) {
+		// The first sync stores the collection and hands its events to the
+		// handlers, as the SDK does: the names go to its contact store first.
+		a, w, warnings := start(t, nil, func(_ *App, w *cursorWA) {
+			w.firstSync = func(name string) error {
+				w.mu.Lock()
+				w.cursors[name] = true
+				w.mu.Unlock()
+				if name == "critical_unblock_low" {
+					w.applyContactBatch(&events.Contact{JID: contact, Timestamp: time.Unix(1, 0), Action: &waSyncAction.ContactAction{FullName: proto.String("First Sync")}})()
+				}
+				return nil
+			}
+		})
+		for _, name := range critical {
+			if incremental, first, full := fetches(w, name); first != 1 || incremental+full != 0 || !w.cursors[name] {
+				t.Fatalf("%s: %d incremental fetches, %d first syncs, %d full replays, cursor=%v", name, incremental, first, full, w.cursors[name])
+			}
+		}
+		if stored, err := a.db.GetContact(contact.String()); err != nil || stored.Name != "First Sync" {
+			t.Fatalf("contact of the first sync: %+v, %v", stored, err)
+		}
+		if warnings["app_state_sync_failed"] != nil || warnings["app_state_first_sync_skipped"] != nil {
+			t.Fatalf("warnings: %v", warnings)
+		}
+	})
+	t.Run("never synced, full sync known broken", func(t *testing.T) {
+		_, w, warnings := start(t, map[string]bool{"critical_unblock_low": true}, func(a *App, w *cursorWA) {
+			if err := a.db.SetAppStateFullSyncBroken("critical_block", true); err != nil {
+				t.Fatal(err)
+			}
+			w.firstSync = func(string) error { t.Error("a first sync was attempted"); return nil }
+		})
+		if incremental, first, full := fetches(w, "critical_block"); incremental+first+full != 0 {
+			t.Fatalf("critical_block: %d incremental fetches, %d first syncs, %d full replays", incremental, first, full)
+		}
+		skipped := warnings["app_state_first_sync_skipped"]
+		if skipped["name"] != "critical_block" || skipped["message"] != "warning: WhatsApp app state critical_block has never synced and its full sync is known broken; not syncing it at start" {
+			t.Fatalf("app_state_first_sync_skipped: %v", skipped)
+		}
+		// The other one is caught up as before.
+		if incremental, first, full := fetches(w, "critical_unblock_low"); incremental != 1 || first+full != 0 {
+			t.Fatalf("critical_unblock_low: %d incremental fetches, %d first syncs, %d full replays", incremental, first, full)
+		}
+	})
+	t.Run("never synced, the first sync fails", func(t *testing.T) {
+		// The SDK reports a failed full sync to the handlers and returns the
+		// error. The start reports it and goes on; the sync handler takes
+		// the usual way, one recovery replay, and nothing asks again.
+		_, w, warnings := start(t, map[string]bool{"critical_unblock_low": true}, func(_ *App, w *cursorWA) {
+			w.firstSync = func(name string) error {
+				err := fmt.Errorf("failed to decode app state %s patches: %w", name, appstate.ErrMismatchingLTHash)
+				w.emit(&events.AppStateSyncError{Name: appstate.WAPatchName(name), FullSync: true, Error: err})
+				return err
+			}
+		})
+		incremental, first, full := fetches(w, "critical_block")
+		failed := warnings["app_state_sync_failed"]
+		if first != 1 || full != 1 || incremental != 0 || failed["name"] != "critical_block" || !strings.Contains(failed["error"].(string), "mismatching LTHash") {
+			t.Fatalf("critical_block: %d incremental fetches, %d first syncs, %d full replays, warning=%v", incremental, first, full, failed)
+		}
+		if warnings["app_state_lthash_mismatch"]["name"] != "critical_block" {
+			t.Fatalf("the failed first sync did not take the usual recovery path: %v", warnings)
 		}
 	})
 }
