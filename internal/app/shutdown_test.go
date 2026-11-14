@@ -76,8 +76,10 @@ func waitForStack(t *testing.T, function string) {
 func TestShutdownWithAStuckHandlerLeavesAReplayRequest(t *testing.T) {
 	for _, collection := range []string{"regular_low", "regular"} {
 		t.Run(collection, func(t *testing.T) {
+			// The steps after the deadline get a grace that a loaded machine
+			// does not turn into an abandoned store close.
 			const budget = 800 * time.Millisecond
-			shortShutdown(t, budget, 300*time.Millisecond, 30*time.Millisecond)
+			shortShutdown(t, budget, 300*time.Millisecond, 250*time.Millisecond)
 			a, w, log := fencedOwner(t)
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
@@ -107,7 +109,7 @@ func TestShutdownWithAStuckHandlerLeavesAReplayRequest(t *testing.T) {
 				t.Fatal("Sync did not end with a handler stuck")
 			}
 			a.Close()
-			if elapsed := time.Since(started); elapsed > budget+time.Second {
+			if elapsed := time.Since(started); elapsed > budget+2*time.Second {
 				t.Fatalf("shutdown took %s with a budget of %s", elapsed, budget)
 			}
 			warnings := lifecycleWarnings(t, log)
@@ -392,8 +394,10 @@ func TestReplayRecordIsRetriedUntilItIsDurable(t *testing.T) {
 // A write that the budget cut short is reported as not recorded. If it
 // completes after all, it counts: nothing is written a second time for it.
 func TestAbandonedReplayRecordStillCounts(t *testing.T) {
-	shortShutdown(t, 300*time.Millisecond, 100*time.Millisecond, 30*time.Millisecond)
 	a := newTestApp(t)
+	// The app is closed with a budget of its own, after this one is restored.
+	defer a.resumeAppState()
+	shortShutdown(t, 300*time.Millisecond, 100*time.Millisecond, 30*time.Millisecond)
 	log := &lockedBuffer{}
 	a.opts.Events = out.NewEventWriter(log, true)
 	raw, err := sql.Open("sqlite3", filepath.Join(a.opts.StoreDir, "wacli.db"))

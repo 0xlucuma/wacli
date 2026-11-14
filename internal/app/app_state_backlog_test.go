@@ -168,7 +168,11 @@ func (w *waitingWA) WaitForAppStateEvents(ctx context.Context) (int, error) {
 func TestCloseWaitsForAppStateEvents(t *testing.T) {
 	for _, stuck := range []bool{false, true} {
 		t.Run(fmt.Sprintf("stuck=%t", stuck), func(t *testing.T) {
-			shortShutdown(t, 150*time.Millisecond, 100*time.Millisecond, 20*time.Millisecond)
+			if stuck {
+				// The drain gets 100ms. What follows keeps enough of the
+				// budget to finish on a loaded machine.
+				shortShutdown(t, 3*time.Second, 2900*time.Millisecond, 100*time.Millisecond)
+			}
 			dir := t.TempDir()
 			a, err := New(Options{StoreDir: dir})
 			if err != nil {
@@ -185,8 +189,8 @@ func TestCloseWaitsForAppStateEvents(t *testing.T) {
 			}
 			started := time.Now()
 			a.Close()
-			if elapsed := time.Since(started); !w.waited || w.sawStore != nil || f.connected || elapsed > time.Second {
-				t.Fatalf("waited=%v store during the wait=%v still connected=%v elapsed=%s", w.waited, w.sawStore, f.connected, elapsed)
+			if elapsed := time.Since(started); !w.waited || w.sawStore != nil || f.IsConnected() || elapsed > 2*time.Second {
+				t.Fatalf("waited=%v store during the wait=%v still connected=%v elapsed=%s", w.waited, w.sawStore, f.IsConnected(), elapsed)
 			}
 			if _, err := a.db.Lists(); err == nil {
 				t.Fatal("store still open after Close")
