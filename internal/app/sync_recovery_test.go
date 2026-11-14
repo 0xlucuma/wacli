@@ -520,6 +520,10 @@ func TestFailedAppStateReplayPersistsIntentAndRecoversAtStartup(t *testing.T) {
 			if collection == string(appstate.WAPatchRegular) && full {
 				return []any{&events.AppStateSyncComplete{Name: appstate.WAPatchRegular}}, nil
 			}
+			if !full && (collection == string(appstate.WAPatchCriticalBlock) || collection == string(appstate.WAPatchCriticalUnblockLow)) {
+				// The start also catches up the critical collections.
+				return nil, nil
+			}
 			if collection != name || !full {
 				t.Fatalf("recovery fetch = %s, full=%v", collection, full)
 			}

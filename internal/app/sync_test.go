@@ -780,8 +780,15 @@ func TestSyncFetchesChatAppStateDeltasAfterConnect(t *testing.T) {
 	f.mu.Lock()
 	fetches := append([]fakeAppStateFetch(nil), f.appStateFetches...)
 	f.mu.Unlock()
-	if len(fetches) != 3 {
+	// The three regular collections, then the catch-up of the two critical
+	// ones, which the fake reports as synced once the regular replay ran.
+	if len(fetches) != 5 {
 		t.Fatalf("app state fetches = %+v", fetches)
+	}
+	for i, name := range []appstate.WAPatchName{appstate.WAPatchCriticalBlock, appstate.WAPatchCriticalUnblockLow} {
+		if fetch := fetches[3+i]; fetch.name != string(name) || fetch.fullSync || fetch.onlyIfNotSynced {
+			t.Fatalf("critical app state fetch %d = %+v", i, fetch)
+		}
 	}
 	if fetches[0].name != string(appstate.WAPatchRegularHigh) || fetches[0].fullSync || fetches[0].onlyIfNotSynced {
 		t.Fatalf("first app state fetch = %+v", fetches[0])
