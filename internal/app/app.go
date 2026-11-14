@@ -150,11 +150,15 @@ type App struct {
 	lateRecoveryStop chan struct{}
 	manualFetchMu    sync.Mutex
 	manualFetches    map[string]int
-	// One deadline for everything a shutdown waits for, and the collections
-	// whose unfinished app state it already reported (see shutdown.go).
-	shutdownMu       sync.Mutex
-	shutdownAt       time.Time
-	shutdownRecorded map[string]bool
+	// One deadline for everything a shutdown waits for, and per collection
+	// what it left unfinished, whether the replay request for it is durably
+	// written, why not, and what the operator was told (see shutdown.go).
+	shutdownMu         sync.Mutex
+	shutdownAt         time.Time
+	shutdownUnfinished map[string]whatsmeow.AppStateUnfinished
+	shutdownRecorded   map[string]bool
+	shutdownRecordErr  map[string]error
+	shutdownReported   map[string]string
 	// contactDrainMu serializes drains of the contact store journal from
 	// snapshot to acknowledgement, and guards contactDebts: the write-ahead
 	// intents of this process's contact saves, each settled by the first
@@ -270,6 +274,8 @@ func (a *App) Close() {
 			map[string]any{"step": "finish queued app state writes", "budget_ms": appShutdownBudget.Milliseconds()})
 	}
 	cancel()
+	// The last chance to write a replay request that failed earlier.
+	a.retryUnfinishedAppStateRecord()
 	a.shutdownStep("close the stores", func() {
 		if sessionResolver != nil {
 			_ = sessionResolver.Close()

@@ -264,6 +264,36 @@ func (a *App) syncAppStateDeltas(ctx context.Context, recoveries *sync.Map) {
 				map[string]any{"name": string(name), "error": err.Error()})
 		}
 	}
+	// The SDK consumes a server notification even when it refuses the fetch
+	// (its event backlog, or the pause of a shutdown), and what it owes then
+	// lives in memory. For the collections above the fetches above make up
+	// for it after a restart; for the two critical ones nothing did until
+	// their next notification. Catch them up here, incrementally, and only
+	// where the SDK has a cursor: without one a fetch would be a full sync,
+	// which belongs to the initial sync after the key share. The captured
+	// fetch reports a failure without starting a recovery, so a collection
+	// whose full sync is known broken is never sent through a full replay.
+	for _, name := range []appstate.WAPatchName{appstate.WAPatchCriticalBlock, appstate.WAPatchCriticalUnblockLow} {
+		if _, recovering := recoveries.Load(string(name)); recovering {
+			continue
+		}
+		synced, err := a.wa.HasLocalAppState(ctx, string(name))
+		if err == nil {
+			if !synced {
+				continue
+			}
+			fetchErr, persistErr := a.fetchAndPersistAppState(ctx, name, false, &appStatePersistenceTracker{})
+			if persistErr == nil && transientAppStateFetch(fetchErr) {
+				continue
+			}
+			err = errors.Join(fetchErr, persistErr)
+		}
+		if err != nil {
+			a.emitWarning("app_state_sync_failed",
+				fmt.Sprintf("warning: failed to sync WhatsApp app state %s: %v", name, err),
+				map[string]any{"name": string(name), "error": err.Error()})
+		}
+	}
 }
 
 func (a *App) warnEmptyAppStateKey(evt *wa.AppStateKeyUnavailable) {

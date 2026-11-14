@@ -88,7 +88,7 @@ type appStateEventsWaiter interface {
 func (a *App) resumeAppState() {
 	a.shutdownMu.Lock()
 	a.shutdownAt = time.Time{}
-	a.shutdownRecorded = nil
+	a.shutdownUnfinished, a.shutdownRecorded, a.shutdownRecordErr, a.shutdownReported = nil, nil, nil, nil
 	a.shutdownMu.Unlock()
 	if fence, ok := a.wa.(appStateFence); ok {
 		fence.ResumeAppState()
@@ -131,56 +131,121 @@ func (a *App) quiesceAppState(waClient WAClient) {
 	a.recordUnfinishedAppState(unfinished)
 }
 
+// recordUnfinishedAppState takes what a drain left unfinished, records the
+// replay requests it calls for, and tells the operator.
+//
+// Three things are kept apart per collection: what is unfinished (the worst
+// seen in this shutdown), whether its replay request is durably written, and
+// what the operator was last told. A write that failed or ran out of budget
+// is not remembered as done: every later step of the shutdown tries it again
+// (retryUnfinishedAppStateRecord), and a change of its outcome is reported.
 func (a *App) recordUnfinishedAppState(unfinished map[appstate.WAPatchName]whatsmeow.AppStateUnfinished) {
 	a.shutdownMu.Lock()
-	if a.shutdownRecorded == nil {
+	if a.shutdownUnfinished == nil {
+		a.shutdownUnfinished = make(map[string]whatsmeow.AppStateUnfinished)
 		a.shutdownRecorded = make(map[string]bool)
+		a.shutdownRecordErr = make(map[string]error)
+		a.shutdownReported = make(map[string]string)
 	}
-	var names []string
-	replay := []string{}
 	for name, state := range unfinished {
-		// Once per shutdown and collection, or again when it got worse.
-		if recorded, seen := a.shutdownRecorded[string(name)]; seen && (recorded || state.Undelivered == 0) {
+		worst := a.shutdownUnfinished[string(name)]
+		worst.Undelivered = max(worst.Undelivered, state.Undelivered)
+		worst.Owed = worst.Owed || state.Owed
+		worst.RecoveryDropped = worst.RecoveryDropped || state.RecoveryDropped
+		a.shutdownUnfinished[string(name)] = worst
+	}
+	a.shutdownMu.Unlock()
+	a.retryUnfinishedAppStateRecord()
+}
+
+// retryUnfinishedAppStateRecord writes the replay requests of this shutdown
+// that are not durable yet, and reports what changed.
+//
+// Only event batches the SDK stored and nobody applied need a replay. An
+// owed fetch or a dropped recovery snapshot stored nothing: the SDK's cursor
+// is not ahead of wacli.db, the start catches up every collection that has a
+// cursor (syncAppStateDeltas), and the recovery request that asked for a
+// snapshot is still recorded.
+func (a *App) retryUnfinishedAppStateRecord() {
+	a.shutdownMu.Lock()
+	var missing []string
+	for name, state := range a.shutdownUnfinished {
+		if state.Undelivered > 0 && !a.shutdownRecorded[name] {
+			missing = append(missing, name)
+		}
+	}
+	a.shutdownMu.Unlock()
+	slices.Sort(missing)
+	if len(missing) > 0 && a.db != nil {
+		// Bounded like every other step: the handler that would not return
+		// may be holding the database. An attempt that is abandoned here may
+		// still complete, and then marks its collections itself. Writing a
+		// request twice is harmless: the replay clears every request of its
+		// collection that is older than its own.
+		a.shutdownStep("record the app state replay request", func() {
+			for _, name := range missing {
+				_, err := a.db.MarkAppStateRecoveryGenerations([]string{name})
+				if err == nil && name == string(appstate.WAPatchRegular) {
+					// Completeness must not be claimed for a projection
+					// that missed events.
+					err = a.db.InvalidateRegularFullSync()
+				}
+				a.shutdownMu.Lock()
+				// Nil once a new owner started over: this attempt was
+				// abandoned long ago, and its request simply stands.
+				if a.shutdownRecorded != nil && err == nil {
+					a.shutdownRecorded[name] = true
+					delete(a.shutdownRecordErr, name)
+				} else if a.shutdownRecordErr != nil && err != nil {
+					a.shutdownRecordErr[name] = err
+				}
+				a.shutdownMu.Unlock()
+			}
+		})
+	}
+
+	a.shutdownMu.Lock()
+	var names, recorded, failed []string
+	var recordErr error
+	for name, state := range a.shutdownUnfinished {
+		said := "unfinished"
+		switch {
+		case state.Undelivered == 0:
+		case a.shutdownRecorded[name]:
+			said = "replay recorded"
+		default:
+			said = "replay not recorded"
+		}
+		if a.shutdownReported[name] == said {
 			continue
 		}
-		a.shutdownRecorded[string(name)] = state.Undelivered > 0
-		names = append(names, string(name))
-		if state.Undelivered > 0 {
-			replay = append(replay, string(name))
+		a.shutdownReported[name] = said
+		names = append(names, name)
+		switch said {
+		case "replay recorded":
+			recorded = append(recorded, name)
+		case "replay not recorded":
+			failed = append(failed, name)
+			if err := a.shutdownRecordErr[name]; err != nil {
+				recordErr = errors.Join(recordErr, fmt.Errorf("%s: %w", name, err))
+			}
 		}
+	}
+	states := make(map[string]whatsmeow.AppStateUnfinished, len(names))
+	for _, name := range names {
+		states[name] = a.shutdownUnfinished[name]
 	}
 	a.shutdownMu.Unlock()
 	if len(names) == 0 {
 		return
 	}
 	slices.Sort(names)
-	slices.Sort(replay)
-	// Durable first. An owed fetch or a dropped recovery snapshot needs no
-	// replay: nothing was stored, so the SDK's cursor is not ahead of
-	// wacli.db, and the recovery request that asked for a snapshot is still
-	// recorded.
-	var recordErr error
-	if len(replay) > 0 && a.db != nil {
-		// Bounded like every other step: the handler that would not return
-		// may be holding the database.
-		var stepErr error
-		if a.shutdownStep("record the app state replay request", func() {
-			_, stepErr = a.db.MarkAppStateRecoveryGenerations(replay)
-			if slices.Contains(replay, string(appstate.WAPatchRegular)) {
-				// Completeness must not be claimed for a projection that
-				// missed events.
-				stepErr = errors.Join(stepErr, a.db.InvalidateRegularFullSync())
-			}
-		}) {
-			recordErr = stepErr
-		} else {
-			recordErr = errors.New("the database did not answer within the shutdown budget")
-		}
-	}
+	slices.Sort(recorded)
+	slices.Sort(failed)
 	details := make([]string, len(names))
 	collections := make(map[string]any, len(names))
 	for i, name := range names {
-		state := unfinished[appstate.WAPatchName(name)]
+		state := states[name]
 		var parts []string
 		if state.Undelivered > 0 {
 			parts = append(parts, fmt.Sprintf("%d event batches not applied", state.Undelivered))
@@ -195,13 +260,16 @@ func (a *App) recordUnfinishedAppState(unfinished map[appstate.WAPatchName]whats
 		collections[name] = map[string]any{"undelivered": state.Undelivered, "owed": state.Owed, "recovery_dropped": state.RecoveryDropped}
 	}
 	message := "warning: stopping with WhatsApp app state unfinished: " + strings.Join(details, "; ")
-	data := map[string]any{"collections": collections, "replay": replay}
-	switch {
-	case recordErr != nil:
-		message += fmt.Sprintf("; could not record the replay of %s for the next start: %v", strings.Join(replay, ", "), recordErr)
+	data := map[string]any{"collections": collections, "replay": append([]string{}, recorded...), "replay_failed": append([]string{}, failed...)}
+	if len(recorded) > 0 {
+		message += fmt.Sprintf("; a replay of %s is recorded for the next start", strings.Join(recorded, ", "))
+	}
+	if len(failed) > 0 {
+		if recordErr == nil {
+			recordErr = errors.New("the database did not answer within the shutdown budget")
+		}
+		message += fmt.Sprintf("; could not record the replay of %s for the next start, trying again until the process stops: %v", strings.Join(failed, ", "), recordErr)
 		data["error"] = recordErr.Error()
-	case len(replay) > 0:
-		message += fmt.Sprintf("; a replay of %s is recorded for the next start", strings.Join(replay, ", "))
 	}
 	a.emitWarning("app_state_shutdown_unfinished", message, data)
 }
