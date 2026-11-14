@@ -79,4 +79,4 @@ require (
 tool github.com/sqlc-dev/sqlc/cmd/sqlc
 
 // vendas/026: production snapshot/409 guards plus upstream contiguous app-state validation.
-replace go.mau.fi/whatsmeow => github.com/nicolasbiondic/whatsmeow v0.0.0-20261114192914-7b8699f8192f
+replace go.mau.fi/whatsmeow => github.com/nicolasbiondic/whatsmeow v0.0.0-20261114210409-c09d80feef59

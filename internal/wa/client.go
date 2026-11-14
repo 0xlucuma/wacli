@@ -74,31 +74,39 @@ func (c *Client) Close() {
 	}
 }
 
-// WaitForAppStateEvents waits until the SDK has delivered every app-state
-// event batch it committed and finished the app-state work that was running,
-// or until ctx ends, and then reports how many batches are still undelivered.
-// Do not call it from an event handler.
-func (c *Client) WaitForAppStateEvents(ctx context.Context) (undelivered int, err error) {
+// PauseAppState stops the SDK from taking on app-state work, waits until it
+// has delivered every app-state event batch it committed or until ctx ends,
+// and returns what is unfinished per collection (see
+// whatsmeow.Client.PauseAppState). Do not call it from an event handler.
+func (c *Client) PauseAppState(ctx context.Context) (map[appstate.WAPatchName]whatsmeow.AppStateUnfinished, error) {
 	c.mu.Lock()
 	cli := c.client
 	c.mu.Unlock()
 	if cli == nil {
-		return 0, nil
+		return nil, nil
 	}
-	if err = cli.WaitForAppStateEvents(ctx); err != nil {
-		for _, name := range appstate.AllPatchNames {
-			undelivered += cli.AppStateBacklog(name).Depth
-		}
+	return cli.PauseAppState(ctx)
+}
+
+// ResumeAppState ends PauseAppState.
+func (c *Client) ResumeAppState() {
+	c.mu.Lock()
+	cli := c.client
+	c.mu.Unlock()
+	if cli != nil {
+		cli.ResumeAppState()
 	}
-	return undelivered, err
 }
 
 // Disconnect stops the socket while retaining the session store for reconnects.
 func (c *Client) Disconnect() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.client != nil {
-		c.client.Disconnect()
+	cli := c.client
+	c.mu.Unlock()
+	// Not under the lock: the SDK can wait seconds here for an event handler
+	// that does not return, and a shutdown has other calls to make meanwhile.
+	if cli != nil {
+		cli.Disconnect()
 	}
 }
 

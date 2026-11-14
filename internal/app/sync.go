@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -178,7 +179,12 @@ func (a *App) Sync(ctx context.Context, opts SyncOptions) (SyncResult, error) {
 
 	ps := &syncPresence{}
 	handlerID, appStateRecoveries := a.addSyncEventHandler(syncCtx, opts, &messagesStored, &lastEvent, disconnected, loggedOut, staleReconnect, enqueueMedia, enqueueWebhook, limits, ps, mediaQ)
-	defer a.wa.RemoveEventHandler(handlerID)
+	// The handler is the persistence owner of the app state the SDK stores.
+	// It is removed only after the SDK has delivered what it committed.
+	a.resumeAppState()
+	waClient := a.wa
+	detachOwner := sync.OnceFunc(func() { a.detachAppStateOwner(waClient, handlerID) })
+	defer detachOwner()
 
 	connectionEpoch.Store(nowUTC().UnixNano())
 	if err := a.connectForSync(syncCtx, opts); err != nil {
@@ -192,10 +198,10 @@ func (a *App) Sync(ctx context.Context, opts SyncOptions) (SyncResult, error) {
 		ps.mu.Lock()
 		ps.cleanupStarted = true
 		ps.mu.Unlock()
-		a.wa.RemoveEventHandler(handlerID)
+		detachOwner()
 		// No presence subscription goes out after this device leaves.
 		a.presenceWatch.stopRenewal()
-		a.sendPresenceBounded(types.PresenceUnavailable)
+		a.sendPresenceUntil(types.PresenceUnavailable, a.shutdownDeadline())
 	}()
 	now = nowUTC().UnixNano()
 	lastEvent.Store(now)

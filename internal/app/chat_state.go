@@ -37,6 +37,8 @@ const (
 // AddChatStatePersistenceHandler captures app-state events that arrive while a
 // one-shot chat-state command is connected. Remove it only after closing the
 // connection so whatsmeow cannot advance another collection without persisting it.
+// Removing it first waits, within the shutdown budget, for the events whatsmeow
+// already committed.
 func (a *App) AddChatStatePersistenceHandler(ctx context.Context) (func(), error) {
 	if err := a.OpenWA(); err != nil {
 		return nil, err
@@ -59,12 +61,9 @@ func (a *App) AddChatStatePersistenceHandler(ctx context.Context) (func(), error
 			a.warnEmptyAppStateKey(v)
 		}
 	})
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			waClient.RemoveEventHandler(handlerID)
-		})
-	}, nil
+	a.resumeAppState()
+	// The handler stays until the SDK has delivered what it committed.
+	return sync.OnceFunc(func() { a.detachAppStateOwner(waClient, handlerID) }), nil
 }
 
 func (a *App) ArchiveChat(ctx context.Context, jid types.JID, archive bool) error {
@@ -795,13 +794,15 @@ func (a *App) fetchAndPersistAppState(ctx context.Context, collection appstate.W
 
 // transientAppStateFetch reports a fetch that stored nothing for a reason
 // that passes: a concurrent SDK adoption made it obsolete, or the SDK refused
-// it because the collection's events are still backed up in event handlers.
-// Neither means the collection is corrupt, and neither leaves anything to
-// replay. A caller that goes on without the fetch is not the one that makes
-// up for a refusal: the SDK owes the collection a fetch, does it when the
-// handlers have caught up, and reports both (see observeAppStateBacklog).
+// it because the collection's events are still backed up in event handlers
+// or because app state is paused for a shutdown. None means the collection is
+// corrupt, and none leaves anything to replay. A caller that goes on without
+// the fetch is not the one that makes up for a refusal: the SDK owes the
+// collection a fetch, does it when the handlers have caught up or app state
+// is resumed, and reports a backlog (see observeAppStateBacklog). What is
+// still owed when the process stops is reported by quiesceAppState.
 func transientAppStateFetch(err error) bool {
-	return errors.Is(err, appstate.ErrStateChanged) || errors.Is(err, whatsmeow.ErrAppStateBacklog)
+	return errors.Is(err, appstate.ErrStateChanged) || errors.Is(err, whatsmeow.ErrAppStateBacklog) || errors.Is(err, whatsmeow.ErrAppStatePaused)
 }
 
 // observeAppStateBacklog turns what the SDK reports about its event backlog
@@ -821,9 +822,14 @@ func (a *App) observeAppStateBacklog(evt any) {
 			fmt.Sprintf("WhatsApp app state %s caught up after its event backlog", v.Name),
 			map[string]any{"name": string(v.Name), "version": v.Version})
 	case *events.AppStateCatchUpFailed:
-		a.emitWarning("app_state_catch_up_failed",
-			fmt.Sprintf("warning: catching up WhatsApp app state %s after its event backlog failed, retrying in %s: %v", v.Name, v.RetryIn, v.Error),
-			map[string]any{"name": string(v.Name), "version": v.Version, "retry_in_ms": v.RetryIn.Milliseconds(), "error": fmt.Sprint(v.Error)})
+		message := fmt.Sprintf("warning: catching up WhatsApp app state %s after its event backlog failed, retrying in %s: %v", v.Name, v.RetryIn, v.Error)
+		if v.RetryIn == 0 {
+			// Nothing is scheduled: an owed fetch waits for the next
+			// connection or fetch, a deferred recovery snapshot is gone.
+			message = fmt.Sprintf("warning: catching up WhatsApp app state %s after its event backlog is on hold until the next connection or fetch: %v", v.Name, v.Error)
+		}
+		a.emitWarning("app_state_catch_up_failed", message,
+			map[string]any{"name": string(v.Name), "version": v.Version, "retry_in_ms": v.RetryIn.Milliseconds(), "on_hold": v.RetryIn == 0, "error": fmt.Sprint(v.Error)})
 	}
 }
 
@@ -834,6 +840,8 @@ func (a *App) retryChangedAppStateFetch(collection appstate.WAPatchName, generat
 	reason := "changed during fetch"
 	if errors.Is(fetchErr, whatsmeow.ErrAppStateBacklog) {
 		reason = "still has events being applied"
+	} else if errors.Is(fetchErr, whatsmeow.ErrAppStatePaused) {
+		reason = "is paused for a shutdown"
 	}
 	return errors.Join(
 		fmt.Errorf("WhatsApp app state %s %s; retry the command: %w", collection, reason, fetchErr),

@@ -60,7 +60,16 @@ func TestAppStateBacklogIsTransient(t *testing.T) {
 	}
 }
 
-func lifecycleWarnings(t *testing.T, log *bytes.Buffer) map[string]map[string]any {
+// Bytes is for lifecycle events that goroutines a shutdown left behind may
+// still write while the test reads.
+func (b *lockedBuffer) Bytes() []byte {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return bytes.Clone(b.buf.Bytes())
+}
+
+// lifecycleWarnings returns the last warning of each code.
+func lifecycleWarnings(t *testing.T, log interface{ Bytes() []byte }) map[string]map[string]any {
 	t.Helper()
 	warnings := map[string]map[string]any{}
 	for line := range bytes.SplitSeq(bytes.TrimSpace(log.Bytes()), []byte("\n")) {
@@ -81,6 +90,16 @@ func lifecycleWarnings(t *testing.T, log *bytes.Buffer) map[string]map[string]an
 	return warnings
 }
 
+// shortShutdown shrinks the shutdown budget for a test.
+func shortShutdown(t *testing.T, budget, reserve, grace time.Duration) {
+	t.Helper()
+	previousBudget, previousReserve, previousGrace := appShutdownBudget, appShutdownReserve, appShutdownGrace
+	appShutdownBudget, appShutdownReserve, appShutdownGrace = budget, reserve, grace
+	t.Cleanup(func() {
+		appShutdownBudget, appShutdownReserve, appShutdownGrace = previousBudget, previousReserve, previousGrace
+	})
+}
+
 // The always-on handler turns each SDK backlog event into its warning.
 func TestAppStateBacklogEventsBecomeWarnings(t *testing.T) {
 	a := newTestApp(t)
@@ -96,23 +115,33 @@ func TestAppStateBacklogEventsBecomeWarnings(t *testing.T) {
 	f.emit(&events.AppStateCaughtUp{Name: appstate.WAPatchRegular, Version: 205})
 	want := map[string]map[string]any{
 		"app_state_backlog":         {"name": "regular", "source": "notification", "depth": float64(64), "oldest_age_ms": float64(90000), "version": float64(205)},
-		"app_state_catch_up_failed": {"name": "regular", "version": float64(205), "retry_in_ms": float64(5000), "error": "timed out"},
+		"app_state_catch_up_failed": {"name": "regular", "version": float64(205), "retry_in_ms": float64(5000), "on_hold": false, "error": "timed out"},
 		"app_state_caught_up":       {"name": "regular", "version": float64(205)},
 	}
-	got := lifecycleWarnings(t, &eventLog)
-	for code, fields := range want {
-		for field, value := range fields {
-			if got[code][field] != value {
-				t.Fatalf("%s.%s = %v, want %v (warning: %v)", code, field, got[code][field], value, got[code])
+	check := func() {
+		t.Helper()
+		got := lifecycleWarnings(t, &eventLog)
+		for code, fields := range want {
+			for field, value := range fields {
+				if got[code][field] != value {
+					t.Fatalf("%s.%s = %v, want %v (warning: %v)", code, field, got[code][field], value, got[code])
+				}
+			}
+			if message, _ := got[code]["message"].(string); !strings.Contains(message, "regular") {
+				t.Fatalf("%s message: %q", code, message)
 			}
 		}
-		if message, _ := got[code]["message"].(string); !strings.Contains(message, "regular") {
-			t.Fatalf("%s message: %q", code, message)
-		}
 	}
+	check()
+	// Without a retry time nothing is scheduled, and the warning says so.
+	f.emit(&events.AppStateCatchUpFailed{Name: appstate.WAPatchRegular, Version: 205, Error: errors.New("not connected")})
+	want["app_state_catch_up_failed"] = map[string]any{"retry_in_ms": float64(0), "on_hold": true, "error": "not connected",
+		"message": "warning: catching up WhatsApp app state regular after its event backlog is on hold until the next connection or fetch: not connected"}
+	check()
 }
 
-// waitingWA is a client that still has app-state events to deliver.
+// waitingWA is a client that can only wait for its app-state events: it has
+// no fence, and cannot say which collections are left.
 type waitingWA struct {
 	*fakeWA
 	app      *App
@@ -132,16 +161,16 @@ func (w *waitingWA) WaitForAppStateEvents(ctx context.Context) (int, error) {
 	return 3, ctx.Err()
 }
 
-// Close waits for the SDK's committed app-state events after disconnecting
-// and before the stores go away. A handler that never finishes costs a
-// bounded wait and a warning, not the shutdown.
+// Close waits for the client's committed app-state events after
+// disconnecting and before the stores go away. Events that are not delivered
+// when the drain's share of the budget ends cost a warning and a replay
+// request for every collection, as this client cannot name them.
 func TestCloseWaitsForAppStateEvents(t *testing.T) {
 	for _, stuck := range []bool{false, true} {
 		t.Run(fmt.Sprintf("stuck=%t", stuck), func(t *testing.T) {
-			previous := appStateEventsCloseWait
-			appStateEventsCloseWait = 50 * time.Millisecond
-			t.Cleanup(func() { appStateEventsCloseWait = previous })
-			a, err := New(Options{StoreDir: t.TempDir()})
+			shortShutdown(t, 150*time.Millisecond, 100*time.Millisecond, 20*time.Millisecond)
+			dir := t.TempDir()
+			a, err := New(Options{StoreDir: dir})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -154,16 +183,33 @@ func TestCloseWaitsForAppStateEvents(t *testing.T) {
 			if err := a.OpenWA(); err != nil {
 				t.Fatal(err)
 			}
+			started := time.Now()
 			a.Close()
-			if !w.waited || w.sawStore != nil || f.connected {
-				t.Fatalf("waited=%v store during the wait=%v still connected=%v", w.waited, w.sawStore, f.connected)
+			if elapsed := time.Since(started); !w.waited || w.sawStore != nil || f.connected || elapsed > time.Second {
+				t.Fatalf("waited=%v store during the wait=%v still connected=%v elapsed=%s", w.waited, w.sawStore, f.connected, elapsed)
 			}
 			if _, err := a.db.Lists(); err == nil {
 				t.Fatal("store still open after Close")
 			}
-			warning, warned := lifecycleWarnings(t, &eventLog)["app_state_events_undelivered"]
-			if warned != stuck || (stuck && (warning["depth"] != float64(3) || warning["waited_ms"] != float64(50))) {
+			warning, warned := lifecycleWarnings(t, &eventLog)["app_state_shutdown_unfinished"]
+			if warned != stuck {
 				t.Fatalf("stuck=%v warning=%v", stuck, warning)
+			}
+			reopened, err := New(Options{StoreDir: dir})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reopened.Close()
+			pending, err := reopened.db.AppStateRecoveryCollections()
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := 0
+			if stuck {
+				want = len(appstate.AllPatchNames)
+			}
+			if len(pending) != want {
+				t.Fatalf("replay requests after reopening: %v, want %d", pending, want)
 			}
 		})
 	}

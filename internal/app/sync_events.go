@@ -65,10 +65,14 @@ func (a *App) addSyncEventHandler(ctx context.Context, opts SyncOptions, message
 	}
 	handlerID := a.wa.AddEventHandler(func(evt any) {
 		if mediaQ != nil {
-			if !mediaQ.beginProducer() {
+			if mediaQ.beginProducer() {
+				defer mediaQ.endProducer()
+			} else if !appStateOwnerEvent(evt) {
+				// Media intake is closed. App state never enqueues media, and
+				// the SDK has already stored it: it is persisted until this
+				// handler is removed.
 				return
 			}
-			defer mediaQ.endProducer()
 		}
 		if opts.Mode == SyncModeFollow && syncActivityEvent(evt) {
 			a.writeHeartbeat()
@@ -1129,7 +1133,35 @@ func (a *App) sendPresence(ctx context.Context, presence types.Presence) {
 // stalled WhatsApp write cannot hold the event handler dispatch lock or
 // block shutdown from reaching the final unavailable cleanup send.
 func (a *App) sendPresenceBounded(presence types.Presence) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	a.sendPresenceUntil(presence, time.Now().Add(5*time.Second))
+}
+
+// sendPresenceUntil is sendPresenceBounded for a shutdown: it also ends at
+// the shutdown deadline, and is skipped when that has passed.
+func (a *App) sendPresenceUntil(presence types.Presence, deadline time.Time) {
+	if limit := time.Now().Add(5 * time.Second); limit.Before(deadline) {
+		deadline = limit
+	}
+	if !time.Now().Before(deadline) {
+		a.emitWarning("shutdown_step_abandoned",
+			fmt.Sprintf("warning: shutdown budget of %s is used up; not waiting any longer to send %s presence", appShutdownBudget, presence),
+			map[string]any{"step": "send " + string(presence) + " presence", "budget_ms": appShutdownBudget.Milliseconds()})
+		return
+	}
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
 	a.sendPresence(ctx, presence)
+}
+
+// appStateOwnerEvent reports the events that carry app state the SDK has
+// already stored, which only this process's persistence handler applies.
+func appStateOwnerEvent(evt any) bool {
+	switch evt.(type) {
+	case *events.AppState, *events.Star, *events.DeleteForMe,
+		*events.Archive, *events.UnarchiveChatsSetting, *events.Pin, *events.Mute, *events.MarkChatAsRead,
+		*events.Contact, *events.LabelEdit, *events.LabelAssociationChat,
+		*events.AppStateSyncStart, *events.AppStateSyncComplete:
+		return true
+	}
+	return false
 }

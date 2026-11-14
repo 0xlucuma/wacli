@@ -150,6 +150,11 @@ type App struct {
 	lateRecoveryStop chan struct{}
 	manualFetchMu    sync.Mutex
 	manualFetches    map[string]int
+	// One deadline for everything a shutdown waits for, and the collections
+	// whose unfinished app state it already reported (see shutdown.go).
+	shutdownMu       sync.Mutex
+	shutdownAt       time.Time
+	shutdownRecorded map[string]bool
 	// contactDrainMu serializes drains of the contact store journal from
 	// snapshot to acknowledgement, and guards contactDebts: the write-ahead
 	// intents of this process's contact saves, each settled by the first
@@ -240,55 +245,42 @@ func (a *App) Close() {
 	sessionResolver := a.sessionResolver
 	sessionState, sessionHandler := a.sessionState, a.sessionHandler
 	a.waMu.Unlock()
+	// Every wait below ends at the one shutdown deadline (see shutdown.go).
 	if waClient != nil {
-		waClient.Disconnect()
-		// Disconnect does not stop the SDK from delivering the app-state
-		// events it already committed. Let it finish while the handlers and
-		// the stores they write to are still there.
-		a.waitForAppStateEvents(waClient)
+		// Disconnecting can wait for an event handler that does not return.
+		a.shutdownStep("disconnect", waClient.Disconnect)
+		// Disconnecting does not stop the SDK from delivering the app-state
+		// events it already committed. Sync and the chat-state commands
+		// wait for them before they remove their persistence handler. This
+		// pauses a client that none of them paused, and reports what is
+		// still unfinished now that the connection is gone.
+		a.quiesceAppState(waClient)
 		if sessionState != nil {
-			waClient.RemoveEventHandler(sessionHandler)
+			a.shutdownStep("remove the session event handler", func() { waClient.RemoveEventHandler(sessionHandler) })
 		}
 	}
 	// A completed command frontier may hand later ready tasks to a background
-	// drainer. Keep SQLite open until that drainer has finished every write.
-	a.appStateRecoveryWorkers.Wait()
-	_ = a.appStatePersist.waitIdle(context.Background())
-	if sessionResolver != nil {
-		_ = sessionResolver.Close()
+	// drainer. Keep SQLite open until that drainer has finished every write,
+	// or the shutdown budget ends.
+	a.shutdownStep("finish the app state recovery workers", a.appStateRecoveryWorkers.Wait)
+	ctx, cancel := a.shutdownContext()
+	if err := a.appStatePersist.waitIdle(ctx); err != nil {
+		a.emitWarning("shutdown_step_abandoned",
+			fmt.Sprintf("warning: shutdown budget of %s is used up; not waiting any longer to finish queued app state writes", appShutdownBudget),
+			map[string]any{"step": "finish queued app state writes", "budget_ms": appShutdownBudget.Milliseconds()})
 	}
-	if waClient != nil {
-		waClient.Close()
-	}
-	if a.db != nil {
-		_ = a.db.Close()
-	}
-}
-
-// appStateEventsWaiter is implemented by the real client.
-type appStateEventsWaiter interface {
-	// WaitForAppStateEvents returns how many event batches were still
-	// undelivered when ctx ended.
-	WaitForAppStateEvents(ctx context.Context) (undelivered int, err error)
-}
-
-var appStateEventsCloseWait = 10 * time.Second
-
-// waitForAppStateEvents must not be called from an event handler: it would
-// wait for itself.
-func (a *App) waitForAppStateEvents(waClient WAClient) {
-	waiter, ok := waClient.(appStateEventsWaiter)
-	if !ok {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), appStateEventsCloseWait)
-	defer cancel()
-	if undelivered, err := waiter.WaitForAppStateEvents(ctx); err != nil {
-		a.emitWarning("app_state_events_undelivered",
-			fmt.Sprintf("warning: closing after %s with %d WhatsApp app state event batches still being applied; they are fetched again on the next start only if the server still reports them",
-				appStateEventsCloseWait, undelivered),
-			map[string]any{"depth": undelivered, "waited_ms": appStateEventsCloseWait.Milliseconds(), "error": err.Error()})
-	}
+	cancel()
+	a.shutdownStep("close the stores", func() {
+		if sessionResolver != nil {
+			_ = sessionResolver.Close()
+		}
+		if waClient != nil {
+			waClient.Close()
+		}
+		if a.db != nil {
+			_ = a.db.Close()
+		}
+	})
 }
 
 func (a *App) EnsureAuthed(ctx context.Context) error {
