@@ -74,6 +74,25 @@ func (c *Client) Close() {
 	}
 }
 
+// WaitForAppStateEvents waits until the SDK has delivered every app-state
+// event batch it committed and finished the app-state work that was running,
+// or until ctx ends, and then reports how many batches are still undelivered.
+// Do not call it from an event handler.
+func (c *Client) WaitForAppStateEvents(ctx context.Context) (undelivered int, err error) {
+	c.mu.Lock()
+	cli := c.client
+	c.mu.Unlock()
+	if cli == nil {
+		return 0, nil
+	}
+	if err = cli.WaitForAppStateEvents(ctx); err != nil {
+		for _, name := range appstate.AllPatchNames {
+			undelivered += cli.AppStateBacklog(name).Depth
+		}
+	}
+	return undelivered, err
+}
+
 // Disconnect stops the socket while retaining the session store for reconnects.
 func (c *Client) Disconnect() {
 	c.mu.Lock()

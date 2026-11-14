@@ -251,7 +251,6 @@ func (a *App) syncAppStateDeltas(ctx context.Context, recoveries *sync.Map) {
 		} else {
 			err = a.wa.FetchAppState(ctx, string(name), false, false)
 			if transientAppStateFetch(err) {
-				a.warnAppStateBacklog(err)
 				continue
 			}
 		}

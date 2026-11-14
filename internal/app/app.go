@@ -217,7 +217,10 @@ func (a *App) OpenWA() error {
 	if a.sessionState == nil {
 		state := newSessionObservation(a.opts.StoreDir)
 		a.sessionState = state
-		a.sessionHandler = a.wa.AddEventHandler(func(evt any) { a.observeSessionState(state, evt) })
+		a.sessionHandler = a.wa.AddEventHandler(func(evt any) {
+			a.observeSessionState(state, evt)
+			a.observeAppStateBacklog(evt)
+		})
 		a.connectGate = make(chan struct{}, 1)
 		a.connectGate <- struct{}{}
 	}
@@ -239,6 +242,10 @@ func (a *App) Close() {
 	a.waMu.Unlock()
 	if waClient != nil {
 		waClient.Disconnect()
+		// Disconnect does not stop the SDK from delivering the app-state
+		// events it already committed. Let it finish while the handlers and
+		// the stores they write to are still there.
+		a.waitForAppStateEvents(waClient)
 		if sessionState != nil {
 			waClient.RemoveEventHandler(sessionHandler)
 		}
@@ -255,6 +262,32 @@ func (a *App) Close() {
 	}
 	if a.db != nil {
 		_ = a.db.Close()
+	}
+}
+
+// appStateEventsWaiter is implemented by the real client.
+type appStateEventsWaiter interface {
+	// WaitForAppStateEvents returns how many event batches were still
+	// undelivered when ctx ended.
+	WaitForAppStateEvents(ctx context.Context) (undelivered int, err error)
+}
+
+var appStateEventsCloseWait = 10 * time.Second
+
+// waitForAppStateEvents must not be called from an event handler: it would
+// wait for itself.
+func (a *App) waitForAppStateEvents(waClient WAClient) {
+	waiter, ok := waClient.(appStateEventsWaiter)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), appStateEventsCloseWait)
+	defer cancel()
+	if undelivered, err := waiter.WaitForAppStateEvents(ctx); err != nil {
+		a.emitWarning("app_state_events_undelivered",
+			fmt.Sprintf("warning: closing after %s with %d WhatsApp app state event batches still being applied; they are fetched again on the next start only if the server still reports them",
+				appStateEventsCloseWait, undelivered),
+			map[string]any{"depth": undelivered, "waited_ms": appStateEventsCloseWait.Milliseconds(), "error": err.Error()})
 	}
 }
 

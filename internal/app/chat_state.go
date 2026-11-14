@@ -759,7 +759,6 @@ func (a *App) fetchAndPersistAppState(ctx context.Context, collection appstate.W
 		// A failed fetch still persists its boundary work below.
 		reserve()
 	}
-	a.warnAppStateBacklog(fetchErr)
 	// Track whether full syncs of this collection verify. Set on an LTHash
 	// mismatch, cleared when a full sync verifies again.
 	if fullSync {
@@ -794,25 +793,38 @@ func (a *App) fetchAndPersistAppState(ctx context.Context, collection appstate.W
 	return fetchErr, <-result
 }
 
-// transientAppStateFetch reports a fetch that fetched and stored nothing for
-// a reason that passes: a concurrent SDK adoption made it obsolete, or the
-// SDK refused it because the collection's committed events are still backed
-// up in event handlers. Neither means the collection is corrupt, and neither
-// leaves anything to replay.
+// transientAppStateFetch reports a fetch that stored nothing for a reason
+// that passes: a concurrent SDK adoption made it obsolete, or the SDK refused
+// it because the collection's events are still backed up in event handlers.
+// Neither means the collection is corrupt, and neither leaves anything to
+// replay. A caller that goes on without the fetch is not the one that makes
+// up for a refusal: the SDK owes the collection a fetch, does it when the
+// handlers have caught up, and reports both (see observeAppStateBacklog).
 func transientAppStateFetch(err error) bool {
 	return errors.Is(err, appstate.ErrStateChanged) || errors.Is(err, whatsmeow.ErrAppStateBacklog)
 }
 
-// warnAppStateBacklog tells the operator how far behind the handlers are.
-func (a *App) warnAppStateBacklog(err error) {
-	var backlog *whatsmeow.AppStateBacklogError
-	if !errors.As(err, &backlog) {
-		return
+// observeAppStateBacklog turns what the SDK reports about its event backlog
+// into lifecycle warnings. The SDK refuses app-state work for a collection
+// whose events are backed up, and fetches what it refused by itself later.
+// It reports that outside the collection's ordered batches, so these arrive
+// even while a persistence handler is still busy with one.
+func (a *App) observeAppStateBacklog(evt any) {
+	switch v := evt.(type) {
+	case *events.AppStateDeferred:
+		a.emitWarning("app_state_backlog",
+			fmt.Sprintf("warning: WhatsApp app state %s was not synced (%s): %d event batches are still being applied, the oldest for %s; it is fetched when they are done",
+				v.Name, v.Source, v.Depth, v.OldestAge.Round(time.Millisecond)),
+			map[string]any{"name": string(v.Name), "source": v.Source, "depth": v.Depth, "oldest_age_ms": v.OldestAge.Milliseconds(), "version": v.Version})
+	case *events.AppStateCaughtUp:
+		a.emitWarning("app_state_caught_up",
+			fmt.Sprintf("WhatsApp app state %s caught up after its event backlog", v.Name),
+			map[string]any{"name": string(v.Name), "version": v.Version})
+	case *events.AppStateCatchUpFailed:
+		a.emitWarning("app_state_catch_up_failed",
+			fmt.Sprintf("warning: catching up WhatsApp app state %s after its event backlog failed, retrying in %s: %v", v.Name, v.RetryIn, v.Error),
+			map[string]any{"name": string(v.Name), "version": v.Version, "retry_in_ms": v.RetryIn.Milliseconds(), "error": fmt.Sprint(v.Error)})
 	}
-	a.emitWarning("app_state_backlog",
-		fmt.Sprintf("warning: WhatsApp app state %s was not synced: %d event batches are still being applied, the oldest for %s; it is retried later",
-			backlog.Name, backlog.Depth, backlog.OldestAge.Round(time.Second)),
-		map[string]any{"name": string(backlog.Name), "depth": backlog.Depth, "oldest_age_ms": backlog.OldestAge.Milliseconds()})
 }
 
 // A transient fetch failure (see transientAppStateFetch) aborts this

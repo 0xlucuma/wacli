@@ -21,6 +21,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/openclaw/wacli/internal/app"
+	"github.com/openclaw/wacli/internal/out"
 	"github.com/openclaw/wacli/internal/sqliteutil"
 	appStore "github.com/openclaw/wacli/internal/store"
 	"github.com/openclaw/wacli/internal/wa"
@@ -242,13 +243,17 @@ func (s transportApplyStore) PutAppStateVersion(ctx context.Context, name string
 	return err
 }
 
-func newRegularTransport(t *testing.T, root *keys.KeyPair) *regularTransport {
+func newRegularTransport(t *testing.T, root *keys.KeyPair, lifecycle ...*out.EventWriter) *regularTransport {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	t.Cleanup(cancel)
 	dir := t.TempDir()
 	wa.PairedSessionStoreAt(t, filepath.Join(dir, "session.db"))
-	a, err := app.New(app.Options{StoreDir: dir})
+	options := app.Options{StoreDir: dir}
+	if len(lifecycle) > 0 {
+		options.Events = lifecycle[0]
+	}
+	a, err := app.New(options)
 	if err != nil {
 		t.Fatal(err)
 	}
