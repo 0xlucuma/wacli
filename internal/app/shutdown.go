@@ -138,7 +138,8 @@ func (a *App) quiesceAppState(waClient WAClient) {
 // seen in this shutdown), whether its replay request is durably written, and
 // what the operator was last told. A write that failed or ran out of budget
 // is not remembered as done: every later step of the shutdown tries it again
-// (retryUnfinishedAppStateRecord), and a change of its outcome is reported.
+// (retryUnfinishedAppStateRecord). The operator is told again whenever what
+// there is to say about a collection changed.
 func (a *App) recordUnfinishedAppState(unfinished map[appstate.WAPatchName]whatsmeow.AppStateUnfinished) {
 	a.shutdownMu.Lock()
 	if a.shutdownUnfinished == nil {
@@ -204,24 +205,41 @@ func (a *App) retryUnfinishedAppStateRecord() {
 		})
 	}
 
+	// A collection is reported when what would be said about it differs
+	// from what was last said: its state got worse in any way, or the
+	// outcome of its replay record changed.
 	a.shutdownMu.Lock()
 	var names, recorded, failed []string
 	var recordErr error
+	describe := make(map[string]string)
+	states := make(map[string]whatsmeow.AppStateUnfinished)
 	for name, state := range a.shutdownUnfinished {
-		said := "unfinished"
+		var parts []string
+		if state.Undelivered > 0 {
+			parts = append(parts, fmt.Sprintf("%d event batches not applied", state.Undelivered))
+		}
+		if state.Owed {
+			parts = append(parts, "a fetch is owed")
+		}
+		if state.RecoveryDropped {
+			parts = append(parts, "a recovery snapshot was dropped")
+		}
+		detail := fmt.Sprintf("%s (%s)", name, strings.Join(parts, ", "))
+		outcome := ""
 		switch {
 		case state.Undelivered == 0:
 		case a.shutdownRecorded[name]:
-			said = "replay recorded"
+			outcome = "replay recorded"
 		default:
-			said = "replay not recorded"
+			outcome = "replay not recorded"
 		}
-		if a.shutdownReported[name] == said {
+		if a.shutdownReported[name] == detail+"; "+outcome {
 			continue
 		}
-		a.shutdownReported[name] = said
+		a.shutdownReported[name] = detail + "; " + outcome
 		names = append(names, name)
-		switch said {
+		describe[name], states[name] = detail, state
+		switch outcome {
 		case "replay recorded":
 			recorded = append(recorded, name)
 		case "replay not recorded":
@@ -230,10 +248,6 @@ func (a *App) retryUnfinishedAppStateRecord() {
 				recordErr = errors.Join(recordErr, fmt.Errorf("%s: %w", name, err))
 			}
 		}
-	}
-	states := make(map[string]whatsmeow.AppStateUnfinished, len(names))
-	for _, name := range names {
-		states[name] = a.shutdownUnfinished[name]
 	}
 	a.shutdownMu.Unlock()
 	if len(names) == 0 {
@@ -246,17 +260,7 @@ func (a *App) retryUnfinishedAppStateRecord() {
 	collections := make(map[string]any, len(names))
 	for i, name := range names {
 		state := states[name]
-		var parts []string
-		if state.Undelivered > 0 {
-			parts = append(parts, fmt.Sprintf("%d event batches not applied", state.Undelivered))
-		}
-		if state.Owed {
-			parts = append(parts, "a fetch is owed")
-		}
-		if state.RecoveryDropped {
-			parts = append(parts, "a recovery snapshot was dropped")
-		}
-		details[i] = fmt.Sprintf("%s (%s)", name, strings.Join(parts, ", "))
+		details[i] = describe[name]
 		collections[name] = map[string]any{"undelivered": state.Undelivered, "owed": state.Owed, "recovery_dropped": state.RecoveryDropped}
 	}
 	message := "warning: stopping with WhatsApp app state unfinished: " + strings.Join(details, "; ")

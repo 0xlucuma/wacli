@@ -271,40 +271,33 @@ func (a *App) syncAppStateDeltas(ctx context.Context, recoveries *sync.Map) {
 	// their next notification. Catch them up here as well, so that every
 	// collection is caught up by every start.
 	//
-	// With a cursor: the captured incremental fetch, which reports a failure
-	// without starting a recovery. Without one the collection never synced,
-	// and the fetch is the SDK's own first sync, as after a key share
-	// (onlyIfNotSynced: it asks nothing if that sync happened meanwhile). A
-	// first sync is a full sync, so it is not attempted where the full sync
-	// is known broken, and its failure takes the usual way: the SDK reports
-	// it to the sync handler, which recovers a collection once per sync.
+	// One captured, ordered fetch per collection, never asked for as a full
+	// replay: nothing is reset, so state that a key share acquires meanwhile
+	// stays, and a failure is reported and nothing more. The SDK reports a
+	// decode failure to the sync handler as well, which leaves this
+	// collection's own fetch alone (ownsManualAppStateFetch): no recovery
+	// replay, no request to the phone, no second attempt in this start.
+	//
+	// Without a cursor the collection never synced, and the SDK turns the
+	// same fetch into its first sync, a full one. That is not attempted
+	// where the collection's full sync is known broken.
 	for _, name := range []appstate.WAPatchName{appstate.WAPatchCriticalBlock, appstate.WAPatchCriticalUnblockLow} {
 		if _, recovering := recoveries.Load(string(name)); recovering {
 			continue
 		}
 		synced, err := a.wa.HasLocalAppState(ctx, string(name))
-		switch {
-		case err != nil:
-		case synced:
+		if err == nil {
+			if !synced && a.isAppStateFullSyncBroken(name) {
+				a.emitWarning("app_state_first_sync_skipped",
+					fmt.Sprintf("warning: WhatsApp app state %s has never synced and its full sync is known broken; not syncing it at start", name),
+					map[string]any{"name": string(name)})
+				continue
+			}
 			fetchErr, persistErr := a.fetchAndPersistAppState(ctx, name, false, &appStatePersistenceTracker{})
 			if persistErr == nil && transientAppStateFetch(fetchErr) {
 				continue
 			}
 			err = errors.Join(fetchErr, persistErr)
-		case a.isAppStateFullSyncBroken(name):
-			a.emitWarning("app_state_first_sync_skipped",
-				fmt.Sprintf("warning: WhatsApp app state %s has never synced and its full sync is known broken; not syncing it at start", name),
-				map[string]any{"name": string(name)})
-			continue
-		default:
-			err = a.wa.FetchAppState(ctx, string(name), false, true)
-			if transientAppStateFetch(err) {
-				continue
-			}
-			if errors.Is(err, wa.ErrEmptyAppStateKeyShare) {
-				a.handleAppStateSyncError(ctx, &events.AppStateSyncError{Name: name, FullSync: true, Error: err}, recoveries)
-				continue
-			}
 		}
 		if err != nil {
 			a.emitWarning("app_state_sync_failed",

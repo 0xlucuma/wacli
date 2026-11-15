@@ -312,6 +312,9 @@ func newRegularTransport(t *testing.T, root *keys.KeyPair, lifecycle ...*out.Eve
 				t.Errorf("syncd: %v", err)
 				return
 			}
+			if response.Tag == "" {
+				continue
+			}
 			if err := peer.write(ctx, response); err != nil {
 				t.Errorf("syncd response: %v", err)
 				return
@@ -454,6 +457,12 @@ type transportSyncd struct {
 	foreign                *appstate.PatchInfo
 	conflicts              int
 	beforeConflictResponse func([]byte) error
+	// others, when set, serves every collection but regular: it returns the
+	// patches to answer with, or the code of an IQ error. The peer then also
+	// answers unrelated queries with an empty result, and takes other nodes
+	// (a presence, a message to the phone) without answering, noting them.
+	others func(name string, version uint64, snapshot bool) (patches []waBinary.Node, iqError string)
+	nodes  []string
 }
 
 func (s *transportSyncd) append(ctx context.Context, raw []byte) error {
@@ -491,6 +500,15 @@ func (s *transportSyncd) since(version uint64) []waBinary.Node {
 
 func (s *transportSyncd) iq(ctx context.Context, iq *waBinary.Node) (waBinary.Node, error) {
 	response := waBinary.Node{Tag: "iq", Attrs: waBinary.Attrs{"id": iq.Attrs["id"], "type": "result", "from": types.ServerJID}}
+	if s.others != nil && (iq.Tag != "iq" || iq.Attrs["xmlns"] != "w:sync:app:state") {
+		s.mu.Lock()
+		s.nodes = append(s.nodes, iq.Tag)
+		s.mu.Unlock()
+		if iq.Tag != "iq" {
+			return waBinary.Node{}, nil
+		}
+		return response, nil
+	}
 	if iq.Tag != "iq" || iq.Attrs["xmlns"] != "w:sync:app:state" {
 		return response, fmt.Errorf("unexpected non-syncd request: %s", iq.Tag)
 	}
@@ -501,6 +519,22 @@ func (s *transportSyncd) iq(ctx context.Context, iq *waBinary.Node) (waBinary.No
 	ag := collection.AttrGetter()
 	// Snapshot requests omit version rather than encoding zero.
 	version, _ := ag.GetUint64("version", false)
+	if name := ag.String("name"); name != "regular" && s.others != nil && ag.Error() == nil {
+		patches, iqError := s.others(name, version, ag.OptionalBool("return_snapshot"))
+		if iqError != "" {
+			response.Attrs["type"] = "error"
+			response.Content = []waBinary.Node{{Tag: "error", Attrs: waBinary.Attrs{"code": iqError, "text": "synthetic"}}}
+			return response, nil
+		}
+		if patches == nil {
+			patches = []waBinary.Node{}
+		}
+		response.Content = []waBinary.Node{{Tag: "sync", Content: []waBinary.Node{{
+			Tag: "collection", Attrs: waBinary.Attrs{"name": name, "has_more_patches": "false"},
+			Content: []waBinary.Node{{Tag: "patches", Content: patches}},
+		}}}}
+		return response, nil
+	}
 	if ag.String("name") != "regular" || ag.Error() != nil {
 		return response, fmt.Errorf("bad collection: %v", ag.Error())
 	}
