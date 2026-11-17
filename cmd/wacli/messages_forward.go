@@ -162,6 +162,11 @@ func sendForward(ctx context.Context, a forwardApp, plan forwardPlan) (forwardOu
 		return a.WA().SendProtoMessage(ctx, toJID, payload.Message)
 	})
 	if err != nil {
+		var timeout *sendAttemptTimeoutError
+		if errors.As(err, &timeout) {
+			// The attempt may have reached WhatsApp before its deadline.
+			return forwardOutcome{}, fmt.Errorf("forward may still have gone through, so check the recipient's chat before retrying: %w", err)
+		}
 		return forwardOutcome{}, err
 	}
 

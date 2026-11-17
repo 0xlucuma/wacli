@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -23,13 +24,24 @@ const (
 
 type fakeForwardWA struct {
 	app.WAClient
+	mu      sync.Mutex
 	sends   []*waProto.Message
 	sentTo  []types.JID
 	sendErr error
+	// blockSend makes the send wait for its attempt deadline, like a frame
+	// whose acknowledgement never arrives.
+	blockSend bool
 }
 
 func (f *fakeForwardWA) IsConnected() bool { return true }
-func (f *fakeForwardWA) Disconnect()       {}
+
+// sendCount reads the sends a timed-out attempt's goroutine may still record.
+func (f *fakeForwardWA) sendCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.sends)
+}
+func (f *fakeForwardWA) Disconnect() {}
 func (f *fakeForwardWA) IsOnWhatsApp(context.Context, []string) ([]types.IsOnWhatsAppResponse, error) {
 	return nil, nil
 }
@@ -39,9 +51,15 @@ func (f *fakeForwardWA) GetUserInfo(context.Context, []types.JID) (map[types.JID
 func (f *fakeForwardWA) ResolveChatName(context.Context, types.JID, string) string {
 	return "Recipient"
 }
-func (f *fakeForwardWA) SendProtoMessage(_ context.Context, to types.JID, msg *waProto.Message) (types.MessageID, error) {
+func (f *fakeForwardWA) SendProtoMessage(ctx context.Context, to types.JID, msg *waProto.Message) (types.MessageID, error) {
+	f.mu.Lock()
 	f.sends = append(f.sends, msg)
 	f.sentTo = append(f.sentTo, to)
+	f.mu.Unlock()
+	if f.blockSend {
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
 	if f.sendErr != nil {
 		return "", f.sendErr
 	}
@@ -350,4 +368,67 @@ func TestDelegatedForwardTakesSendSlotAndPacer(t *testing.T) {
 			t.Fatalf("response = %+v", resp)
 		}
 	})
+}
+
+// The inner send attempt (45 s in production) can expire while the caller's
+// budget is still open. The forward may have reached WhatsApp by then, so the
+// delegated answer must say so; a lookup failure must not.
+func TestDelegatedForwardInnerAttemptTimeoutIsUncertain(t *testing.T) {
+	skipPresenceDelegateSocketTestOnUnsupportedOS(t)
+	previous := sendAttemptTimeout
+	sendAttemptTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { sendAttemptTimeout = previous })
+
+	for _, mode := range []string{"attempt-timeout", "unknown-source"} {
+		t.Run(mode, func(t *testing.T) {
+			storeDir := shortPresenceDelegateStoreDir(t)
+			lk, err := lock.Acquire(storeDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer lk.Release()
+			owner := newForwardTestApp(t)
+			owner.client.blockSend = true
+			stop, err := startSendDelegateServerForStore(t.Context(), storeDir, sendSpacing{}, func(ctx context.Context, req sendDelegateRequest) (sendDelegateResponse, error) {
+				return executeDelegatedForward(ctx, owner, req)
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer stop()
+			id := "TEXT"
+			if mode == "unknown-source" {
+				id = "NOPE"
+			}
+			// The caller's budget (5 s) is far longer than the attempt's.
+			stdout, stderr, err := runPresenceDelegateHelper(t, []string{
+				"--store", storeDir, "--json", "--timeout", "5s",
+				"messages", "forward", "--chat", forwardTestSourceChat, "--id", id, "--to", forwardTestRecipient, "--post-send-wait", "0s",
+			})
+			if err == nil || strings.Contains(stdout, `"forwarded":true`) {
+				t.Fatalf("unexpected success: %v %s %s", err, stdout, stderr)
+			}
+			uncertain := strings.Contains(stderr, "may still have gone through")
+			if mode == "attempt-timeout" {
+				if !uncertain || !strings.Contains(stderr, "send timed out after 100ms") || owner.client.sendCount() != 1 {
+					t.Fatalf("inner timeout lost its uncertainty or was retried: sends=%d stderr=%s", owner.client.sendCount(), stderr)
+				}
+			} else if uncertain || owner.client.sendCount() != 0 {
+				t.Fatalf("lookup failure marked uncertain or sent: sends=%d stderr=%s", owner.client.sendCount(), stderr)
+			}
+		})
+	}
+}
+
+// The typed attempt timeout keeps the historical text other send commands
+// print, and only forward adds the warning.
+func TestSendAttemptTimeoutKeepsItsText(t *testing.T) {
+	_, err := runSendAttempt(t.Context(), 10*time.Millisecond, func(ctx context.Context) (string, error) {
+		<-ctx.Done()
+		return "", ctx.Err()
+	})
+	var timeout *sendAttemptTimeoutError
+	if !errors.As(err, &timeout) || err.Error() != "send timed out after 10ms" || errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("attempt timeout = %#v (%v)", err, err)
+	}
 }
