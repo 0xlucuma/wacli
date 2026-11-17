@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"github.com/openclaw/wacli/internal/lock"
 	"github.com/openclaw/wacli/internal/store"
 	"github.com/openclaw/wacli/internal/wa"
+	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/types"
 )
 
@@ -356,7 +358,7 @@ func TestGroupCreateLostReplyIsUnknownAndNeverRetried(t *testing.T) {
 
 func TestGroupCreateOldOwnerAndMissingResult(t *testing.T) {
 	skipPresenceDelegateSocketTestOnUnsupportedOS(t)
-	for _, mode := range []string{"old-owner", "missing-result", "owner-error"} {
+	for _, mode := range []string{"old-owner", "missing-result", "owner-error", "sdk-unconfirmed"} {
 		t.Run(mode, func(t *testing.T) {
 			storeDir := lockedGroupCreateStore(t)
 			stop, err := startSendDelegateServerForStore(t.Context(), storeDir, sendSpacing{}, func(_ context.Context, got sendDelegateRequest) (sendDelegateResponse, error) {
@@ -366,6 +368,10 @@ func TestGroupCreateOldOwnerAndMissingResult(t *testing.T) {
 					return sendDelegateResponse{}, errors.New(`unsupported send kind "` + got.Kind + `"`)
 				case "owner-error":
 					return sendDelegateResponse{}, errors.New("not connected")
+				case "sdk-unconfirmed":
+					// What the owner's no-replay create reports when the socket
+					// drops after the frame left.
+					return sendDelegateResponse{}, fmt.Errorf("%w: %w", wa.ErrGroupCreateUnconfirmed, &whatsmeow.DisconnectedError{Action: "info query"})
 				}
 				return sendDelegateResponse{OK: true}, nil
 			})
@@ -398,6 +404,11 @@ func TestGroupCreateOldOwnerAndMissingResult(t *testing.T) {
 				if envelope.Error != "not connected" {
 					t.Fatalf("owner error changed: %q", envelope.Error)
 				}
+			case "sdk-unconfirmed":
+				want := wa.ErrGroupCreateUnconfirmed.Error() + ": websocket disconnected before info query returned response"
+				if envelope.Error != want {
+					t.Fatalf("unconfirmed create error = %q, want %q", envelope.Error, want)
+				}
 			}
 		})
 	}
@@ -407,5 +418,59 @@ func TestGroupCreateHelpMarksDelegation(t *testing.T) {
 	stdout, stderr, err := runPresenceDelegateHelper(t, []string{"groups", "create", "--help"})
 	if err != nil || !strings.Contains(stdout, "Delegates to the running sync process when the store is locked.") {
 		t.Fatalf("missing help capability marker: %v %s %s", err, stdout, stderr)
+	}
+}
+
+// An OK reply that carries no group (no wrapper, an empty wrapper, or a null
+// group) is an unknown outcome in both output modes: no success, no retry and
+// no standalone fallback.
+func TestGroupCreateReplyWithoutGroupIsUnknown(t *testing.T) {
+	skipPresenceDelegateSocketTestOnUnsupportedOS(t)
+	for _, reply := range []string{`{"ok":true,"group_create":{}}`, `{"ok":true,"group_create":{"info":null}}`, `{"ok":true}`} {
+		for _, asJSON := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s/json=%t", reply, asJSON), func(t *testing.T) {
+				storeDir := lockedGroupCreateStore(t)
+				ln, err := delegate.Listen(storeDir)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer ln.Close()
+				var accepted atomic.Int32
+				go func() {
+					for {
+						conn, err := ln.Accept()
+						if err != nil {
+							return
+						}
+						accepted.Add(1)
+						var req sendDelegateRequest
+						_ = json.NewDecoder(conn).Decode(&req)
+						_, _ = conn.Write([]byte(reply + "\n"))
+						_ = conn.Close()
+					}
+				}()
+				args := []string{"--store", storeDir, "--timeout", "2s"}
+				if asJSON {
+					args = append(args, "--json")
+				}
+				stdout, stderr, err := runPresenceDelegateHelper(t, append(args, groupCreateTestArgs()...))
+				if err == nil {
+					t.Fatalf("reply without a group reported success: stdout=%q stderr=%q", stdout, stderr)
+				}
+				if !strings.Contains(stderr, "did not report the created group; the group may exist, so check before creating it again") {
+					t.Fatalf("stderr = %q", stderr)
+				}
+				output := strings.TrimSuffix(stdout, "PASS\n")
+				if strings.Contains(output, `"success":true`) || strings.Contains(output, "OK") || strings.Contains(output, "JID:") {
+					t.Fatalf("stdout reported a group: %q", stdout)
+				}
+				if strings.Contains(stderr, "store is locked") || strings.Contains(stderr, "not authenticated") {
+					t.Fatalf("fell back to the standalone path: %q", stderr)
+				}
+				if n := accepted.Load(); n != 1 {
+					t.Fatalf("create dispatched %d times, want once", n)
+				}
+			})
+		}
 	}
 }

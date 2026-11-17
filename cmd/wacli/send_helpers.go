@@ -16,7 +16,9 @@ import (
 	"go.mau.fi/whatsmeow/types"
 )
 
-const sendAttemptTimeout = 45 * time.Second
+// sendAttemptTimeout bounds one send attempt. A var only so tests can shorten it.
+var sendAttemptTimeout = 45 * time.Second
+
 const postSendRetryReceiptWait = 2 * time.Second
 const rapidSendWarningThreshold = 5 * time.Second
 const lastSendAttemptFile = ".last-send-at"
@@ -70,16 +72,27 @@ func runSendAttempt[T any](ctx context.Context, timeout time.Duration, op func(c
 	case res := <-ch:
 		if errors.Is(res.err, context.DeadlineExceeded) && errors.Is(attemptCtx.Err(), context.DeadlineExceeded) {
 			var zero T
-			return zero, fmt.Errorf("send timed out after %s", timeout)
+			return zero, &sendAttemptTimeoutError{timeout: timeout}
 		}
 		return res.value, res.err
 	case <-attemptCtx.Done():
 		var zero T
 		if errors.Is(attemptCtx.Err(), context.DeadlineExceeded) {
-			return zero, fmt.Errorf("send timed out after %s", timeout)
+			return zero, &sendAttemptTimeoutError{timeout: timeout}
 		}
 		return zero, attemptCtx.Err()
 	}
+}
+
+// sendAttemptTimeoutError is a send attempt that ran out of time, possibly
+// after its frame left. Its text is the historical one; the type lets a caller
+// tell it apart from refusals.
+type sendAttemptTimeoutError struct {
+	timeout time.Duration
+}
+
+func (e *sendAttemptTimeoutError) Error() string {
+	return fmt.Sprintf("send timed out after %s", e.timeout)
 }
 
 func isRetryableSendError(err error) bool {

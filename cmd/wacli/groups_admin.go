@@ -54,7 +54,9 @@ func newGroupsCreateCmd(flags *rootFlags) *cobra.Command {
 					if delegateErr != nil {
 						return explainGroupCreateDelegateError(delegateErr)
 					}
-					if resp.GroupCreate == nil {
+					// A reply without the group, wrapper or not, is not a success:
+					// the create was dispatched and may have happened.
+					if resp.GroupCreate == nil || resp.GroupCreate.Info == nil {
 						return fmt.Errorf("the running sync process did not report the created group; the group may exist, so check before creating it again, and restart `wacli sync` after upgrading")
 					}
 					return writeGroupCreateResult(flags, resp.GroupCreate.Info)
