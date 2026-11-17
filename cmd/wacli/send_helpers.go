@@ -194,6 +194,13 @@ type whatsappRegistrationResolver interface {
 }
 
 func warmupRecipient(ctx context.Context, wa userInfoResolver, jid types.JID, stderr io.Writer) types.JID {
+	return warmupRecipientAs(ctx, wa, jid, "", stderr)
+}
+
+// warmupRecipientAs names the recipient as label in its warnings, so callers
+// writing to a shared log can keep the JID out of it. An empty label prints
+// the JID, as warmupRecipient always has.
+func warmupRecipientAs(ctx context.Context, wa userInfoResolver, jid types.JID, label string, stderr io.Writer) types.JID {
 	if jid.Server != types.DefaultUserServer && jid.Server != types.HiddenUserServer {
 		return jid
 	}
@@ -201,7 +208,7 @@ func warmupRecipient(ctx context.Context, wa userInfoResolver, jid types.JID, st
 		if resolver, ok := any(wa).(whatsappRegistrationResolver); ok {
 			registrations, regErr := resolver.IsOnWhatsApp(ctx, []string{"+" + jid.User})
 			if regErr != nil {
-				fmt.Fprintf(stderr, "warn: send registration warmup for %s failed (send will proceed): %v\n", jid, regErr)
+				fmt.Fprintf(stderr, "warn: send registration warmup for %s failed (send will proceed): %v\n", warmupLabel(label, jid), regErr)
 			} else if len(registrations) > 0 && registrations[0].IsIn && !registrations[0].JID.IsEmpty() {
 				jid = registrations[0].JID.ToNonAD()
 			}
@@ -209,7 +216,14 @@ func warmupRecipient(ctx context.Context, wa userInfoResolver, jid types.JID, st
 	}
 	_, err := wa.GetUserInfo(ctx, []types.JID{jid})
 	if err != nil {
-		fmt.Fprintf(stderr, "warn: send warmup for %s failed (send will proceed): %v\n", jid, err)
+		fmt.Fprintf(stderr, "warn: send warmup for %s failed (send will proceed): %v\n", warmupLabel(label, jid), err)
 	}
 	return jid
+}
+
+func warmupLabel(label string, jid types.JID) string {
+	if label != "" {
+		return label
+	}
+	return jid.String()
 }

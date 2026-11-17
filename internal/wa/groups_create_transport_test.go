@@ -675,3 +675,41 @@ func TestGroupCreateOutcomeClassification(t *testing.T) {
 		}
 	}
 }
+
+// Build errors name the participant by position: a phone number or LID in an
+// error ends up in the owner's log and in the caller's JSON.
+func TestBuildCreateGroupNodeErrorsNamePositionsNotJIDs(t *testing.T) {
+	ctx := context.Background()
+	container, err := sqlstore.New(ctx, "sqlite3", sqliteutil.FileURI(filepath.Join(t.TempDir(), "session.db"), "_foreign_keys=on"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	device := container.NewDevice()
+	device.ID = &testOwnJID
+	device.Account = testAccount()
+	if err := device.Save(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cli := whatsmeow.NewClient(device, waLog.Noop)
+	// Every lookup below now fails inside the device store.
+	if err := container.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		participants []types.JID
+		want         string
+	}{
+		{[]types.JID{testPNParticipant, testLIDParticipant}, "failed to get privacy token for participant 1 of 2"},
+		{[]types.JID{testLIDParticipant}, "failed to get phone number for participant 1 of 1"},
+	} {
+		_, err := buildCreateGroupNode(ctx, cli, whatsmeow.ReqCreateGroup{Name: "x", Participants: tc.participants})
+		if err == nil || !strings.HasPrefix(err.Error(), tc.want) {
+			t.Fatalf("error = %v, want prefix %q", err, tc.want)
+		}
+		for _, jid := range tc.participants {
+			if strings.Contains(err.Error(), jid.User) {
+				t.Fatalf("error names a participant: %v", err)
+			}
+		}
+	}
+}

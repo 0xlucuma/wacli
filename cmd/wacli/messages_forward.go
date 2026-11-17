@@ -11,6 +11,7 @@ import (
 	"github.com/openclaw/wacli/internal/app"
 	"github.com/openclaw/wacli/internal/out"
 	"github.com/openclaw/wacli/internal/store"
+	"github.com/openclaw/wacli/internal/wa"
 	"github.com/spf13/cobra"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/types"
@@ -32,6 +33,13 @@ func newMessagesForwardCmd(flags *rootFlags) *cobra.Command {
 			if strings.TrimSpace(chat) == "" || strings.TrimSpace(id) == "" || strings.TrimSpace(to) == "" {
 				return fmt.Errorf("--chat, --id, and --to are required")
 			}
+			if pick != 0 {
+				return errForwardPick
+			}
+			// Refuse names before the store opens or anything is dispatched.
+			if _, err := parseForwardRecipient(to); err != nil {
+				return err
+			}
 			if err := flags.requireWritable(); err != nil {
 				return err
 			}
@@ -46,7 +54,6 @@ func newMessagesForwardCmd(flags *rootFlags) *cobra.Command {
 					Chat:           chat,
 					ID:             id,
 					To:             to,
-					Pick:           pick,
 					PostSendWaitMS: durationMillis(postSendWait),
 				})
 				if delegated {
@@ -63,7 +70,7 @@ func newMessagesForwardCmd(flags *rootFlags) *cobra.Command {
 			if err := a.EnsureAuthed(ctx); err != nil {
 				return err
 			}
-			plan, err := prepareForward(ctx, a, chat, id, to, pick, flags.asJSON)
+			plan, err := prepareForward(ctx, a, chat, id, to)
 			if err != nil {
 				return err
 			}
@@ -83,8 +90,10 @@ func newMessagesForwardCmd(flags *rootFlags) *cobra.Command {
 	}
 	cmd.Flags().StringVar(&chat, "chat", "", "source chat JID or phone number")
 	cmd.Flags().StringVar(&id, "id", "", "source message ID to forward")
-	cmd.Flags().StringVar(&to, "to", "", "recipient JID, phone number, or contact/group/chat name")
-	cmd.Flags().IntVar(&pick, "pick", 0, "when --to is ambiguous, pick the Nth match (1-indexed)")
+	cmd.Flags().StringVar(&to, "to", "", "recipient JID or exact phone number (names are not looked up)")
+	// Kept so older invocations fail with a clear message instead of an unknown flag.
+	cmd.Flags().IntVar(&pick, "pick", 0, "not supported: forward takes a JID or phone number")
+	_ = cmd.Flags().MarkHidden("pick")
 	cmd.Flags().DurationVar(&postSendWait, "post-send-wait", postSendRetryReceiptWait, "keep the connection alive after forward so retry receipts can be handled (0 disables)")
 	return cmd
 }
@@ -118,9 +127,33 @@ func (o forwardOutcome) storeWarning() string {
 	return o.storeErr.Error()
 }
 
+var (
+	errForwardRecipient = errors.New("--to must be a JID (containing @) or a phone number; forward does not look up names")
+	errForwardPick      = errors.New("--pick does not apply: forward takes a JID or phone number, not a name")
+)
+
+// parseForwardRecipient accepts only an explicit JID or an exact phone number.
+// Forward never resolves names: a fuzzy match could copy a stored message to
+// the wrong person. The error never echoes the input or any candidate.
+func parseForwardRecipient(to string) (types.JID, error) {
+	to = strings.TrimSpace(to)
+	if to == "" {
+		return types.JID{}, fmt.Errorf("--to is required")
+	}
+	jid, err := wa.ParseUserOrJID(to)
+	if err != nil {
+		return types.JID{}, errForwardRecipient
+	}
+	return jid, nil
+}
+
 // prepareForward reads and validates the source message and recipient from
 // the local store. It never touches the network.
-func prepareForward(ctx context.Context, a messageChatApp, chat, id, to string, pick int, asJSON bool) (forwardPlan, error) {
+func prepareForward(ctx context.Context, a messageChatApp, chat, id, to string) (forwardPlan, error) {
+	toJID, err := parseForwardRecipient(to)
+	if err != nil {
+		return forwardPlan{}, err
+	}
 	source, _, err := loadMessageMutationTarget(ctx, a, chat, id)
 	if err != nil {
 		return forwardPlan{}, err
@@ -136,10 +169,6 @@ func prepareForward(ctx context.Context, a messageChatApp, chat, id, to string, 
 		}
 		mediaInfo = &info
 	}
-	toJID, err := resolveRecipient(a, to, recipientOptions{pick: pick, asJSON: asJSON})
-	if err != nil {
-		return forwardPlan{}, err
-	}
 	if mediaInfo != nil && toJID.Server == types.NewsletterServer {
 		return forwardPlan{}, fmt.Errorf("media forwarding to channels is not supported")
 	}
@@ -150,7 +179,8 @@ func prepareForward(ctx context.Context, a messageChatApp, chat, id, to string, 
 // outgoing copy. A local history failure is returned as storeErr, not as an
 // error: the message was already delivered.
 func sendForward(ctx context.Context, a forwardApp, plan forwardPlan) (forwardOutcome, error) {
-	toJID := warmupRecipient(ctx, a.WA(), plan.to, os.Stderr)
+	// The sync owner's stderr is a log: name the recipient's role, not its JID.
+	toJID := warmupRecipientAs(ctx, a.WA(), plan.to, "the forward recipient", os.Stderr)
 	if err := warnRapidSendIfNeeded(a.StoreDir(), time.Now().UTC(), os.Stderr); err != nil {
 		return forwardOutcome{}, err
 	}

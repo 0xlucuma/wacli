@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -31,6 +34,8 @@ type fakeForwardWA struct {
 	// blockSend makes the send wait for its attempt deadline, like a frame
 	// whose acknowledgement never arrives.
 	blockSend bool
+	// warmupErr fails both recipient warmup lookups.
+	warmupErr error
 }
 
 func (f *fakeForwardWA) IsConnected() bool { return true }
@@ -43,10 +48,10 @@ func (f *fakeForwardWA) sendCount() int {
 }
 func (f *fakeForwardWA) Disconnect() {}
 func (f *fakeForwardWA) IsOnWhatsApp(context.Context, []string) ([]types.IsOnWhatsAppResponse, error) {
-	return nil, nil
+	return nil, f.warmupErr
 }
 func (f *fakeForwardWA) GetUserInfo(context.Context, []types.JID) (map[types.JID]types.UserInfo, error) {
-	return nil, nil
+	return nil, f.warmupErr
 }
 func (f *fakeForwardWA) ResolveChatName(context.Context, types.JID, string) string {
 	return "Recipient"
@@ -107,7 +112,7 @@ func forwardRequest(id, to string) sendDelegateRequest {
 }
 
 func TestSendDelegateRequestPreservesForwardInJSON(t *testing.T) {
-	raw, err := json.Marshal(sendDelegateRequest{Version: sendDelegateVersion, Kind: forwardKind, Chat: forwardTestSourceChat, ID: "TEXT", To: "Family", Pick: 2, PostSendWaitMS: 25})
+	raw, err := json.Marshal(sendDelegateRequest{Version: sendDelegateVersion, Kind: forwardKind, Chat: forwardTestSourceChat, ID: "TEXT", To: "+1 (555) 222-3333", PostSendWaitMS: 25})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +123,7 @@ func TestSendDelegateRequestPreservesForwardInJSON(t *testing.T) {
 	if err := json.Unmarshal(raw, &got); err != nil {
 		t.Fatal(err)
 	}
-	if got.Kind != forwardKind || got.Chat != forwardTestSourceChat || got.ID != "TEXT" || got.To != "Family" || got.Pick != 2 || got.PostSendWaitMS != 25 {
+	if got.Kind != forwardKind || got.Chat != forwardTestSourceChat || got.ID != "TEXT" || got.To != "+1 (555) 222-3333" || got.Pick != 0 || got.PostSendWaitMS != 25 {
 		t.Fatalf("decoded request = %+v", got)
 	}
 
@@ -227,13 +232,13 @@ func TestMessagesForwardDelegatesThroughProductionServerWhenStoreLocked(t *testi
 
 	stdout, stderr, err := runPresenceDelegateHelper(t, []string{
 		"--store", storeDir, "--json", "--timeout", "750ms",
-		"messages", "forward", "--chat", forwardTestSourceChat, "--id", "TEXT", "--to", forwardTestRecipient, "--pick", "2", "--post-send-wait", "25ms",
+		"messages", "forward", "--chat", forwardTestSourceChat, "--id", "TEXT", "--to", forwardTestRecipient, "--post-send-wait", "25ms",
 	})
 	if err != nil {
 		t.Fatalf("delegation failed: %v stdout=%s stderr=%s", err, stdout, stderr)
 	}
 	got := <-requests
-	if got.Kind != forwardKind || got.Version != sendDelegateVersion || got.Chat != forwardTestSourceChat || got.ID != "TEXT" || got.To != forwardTestRecipient || got.Pick != 2 || got.PostSendWaitMS != 25 || got.TimeoutMS != 750 || got.DeadlineUnixMS == 0 {
+	if got.Kind != forwardKind || got.Version != sendDelegateVersion || got.Chat != forwardTestSourceChat || got.ID != "TEXT" || got.To != forwardTestRecipient || got.Pick != 0 || got.PostSendWaitMS != 25 || got.TimeoutMS != 750 || got.DeadlineUnixMS == 0 {
 		t.Fatalf("request = %+v", got)
 	}
 	if strings.Contains(stderr, "store is locked") || !strings.Contains(stderr, "message delivered (id FORWARDED-1) but local history update failed: message update: disk full") {
@@ -430,5 +435,153 @@ func TestSendAttemptTimeoutKeepsItsText(t *testing.T) {
 	var timeout *sendAttemptTimeoutError
 	if !errors.As(err, &timeout) || err.Error() != "send timed out after 10ms" || errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("attempt timeout = %#v (%v)", err, err)
+	}
+}
+
+// A chat whose name a fuzzy lookup would pick for "Family".
+const forwardTestNamedChat = "444000@g.us"
+
+func seedForwardNamedChat(t *testing.T, a *forwardTestApp) {
+	t.Helper()
+	if err := a.DB().UpsertChat(forwardTestNamedChat, "group", "Family Group", time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestParseForwardRecipientAcceptsOnlyJIDsAndExactPhones(t *testing.T) {
+	for input, want := range map[string]string{
+		forwardTestRecipient:      forwardTestRecipient,
+		"+1 (555) 222-3333":       "15552223333@s.whatsapp.net",
+		"15552223333":             "15552223333@s.whatsapp.net",
+		"333000@lid":              "333000@lid",
+		"120363000000000001@g.us": "120363000000000001@g.us",
+	} {
+		got, err := parseForwardRecipient(input)
+		if err != nil || got.String() != want {
+			t.Fatalf("%q -> %v, %v; want %s", input, got, err, want)
+		}
+	}
+	for _, input := range []string{"Family", "Family Group", "Fam", "555 Family", "+1 555 FAMILY", "12345"} {
+		_, err := parseForwardRecipient(input)
+		if !errors.Is(err, errForwardRecipient) || strings.Contains(err.Error(), input) {
+			t.Fatalf("%q -> %v, want the generic refusal without the input", input, err)
+		}
+	}
+}
+
+func TestExecuteDelegatedForwardNeverResolvesNames(t *testing.T) {
+	t.Run("name refused without candidates", func(t *testing.T) {
+		a := newForwardTestApp(t)
+		seedForwardNamedChat(t, a)
+		// resolveRecipient would auto-pick the single "Family Group" match.
+		if jid, err := resolveRecipient(a, "Family", recipientOptions{asJSON: true}); err != nil || jid.String() != forwardTestNamedChat {
+			t.Fatalf("fixture: name lookup = %v, %v", jid, err)
+		}
+		_, err := executeDelegatedForward(t.Context(), a, forwardRequest("TEXT", "Family"))
+		if !errors.Is(err, errForwardRecipient) || a.client.sendCount() != 0 {
+			t.Fatalf("name reached WhatsApp or got another error: %v sends=%d", err, a.client.sendCount())
+		}
+		for _, leaked := range []string{"Family Group", "444000", "g.us"} {
+			if strings.Contains(err.Error(), leaked) {
+				t.Fatalf("error leaks candidate data %q: %v", leaked, err)
+			}
+		}
+	})
+	t.Run("pick refused", func(t *testing.T) {
+		a := newForwardTestApp(t)
+		req := forwardRequest("TEXT", forwardTestRecipient)
+		req.Pick = 1
+		if _, err := executeDelegatedForward(t.Context(), a, req); !errors.Is(err, errForwardPick) || a.client.sendCount() != 0 {
+			t.Fatalf("pick = %v sends=%d", err, a.client.sendCount())
+		}
+	})
+	for _, tc := range []struct{ to, want string }{
+		{"+1 (555) 222-3333", "15552223333@s.whatsapp.net"},
+		{forwardTestRecipient, forwardTestRecipient},
+		{forwardTestNamedChat, forwardTestNamedChat},
+	} {
+		t.Run("accepted "+tc.to, func(t *testing.T) {
+			a := newForwardTestApp(t)
+			seedForwardNamedChat(t, a)
+			resp, err := executeDelegatedForward(t.Context(), a, forwardRequest("TEXT", tc.to))
+			if err != nil || resp.To != tc.want || a.client.sendCount() != 1 || a.client.sentTo[0].String() != tc.want {
+				t.Fatalf("resp=%+v err=%v sentTo=%v", resp, err, a.client.sentTo)
+			}
+		})
+	}
+}
+
+// The CLI refuses a name, or --pick, before opening the store or dispatching,
+// on the live (delegated) and standalone paths alike.
+func TestMessagesForwardRefusesNamesBeforeDispatch(t *testing.T) {
+	skipPresenceDelegateSocketTestOnUnsupportedOS(t)
+	for _, tc := range []struct {
+		name  string
+		extra []string
+		want  string
+	}{
+		{"name", []string{"--to", "Family"}, errForwardRecipient.Error()},
+		{"pick", []string{"--to", forwardTestRecipient, "--pick", "1"}, errForwardPick.Error()},
+	} {
+		for _, live := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s/live=%t", tc.name, live), func(t *testing.T) {
+				storeDir := shortPresenceDelegateStoreDir(t)
+				var dispatched atomic.Int32
+				if live {
+					lk, err := lock.Acquire(storeDir)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer lk.Release()
+					stop, err := startSendDelegateServerForStore(t.Context(), storeDir, sendSpacing{}, func(context.Context, sendDelegateRequest) (sendDelegateResponse, error) {
+						dispatched.Add(1)
+						return sendDelegateResponse{OK: true, Sent: true}, nil
+					})
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer stop()
+				}
+				args := append([]string{"--store", storeDir, "--json", "messages", "forward", "--chat", forwardTestSourceChat, "--id", "TEXT"}, tc.extra...)
+				stdout, stderr, err := runPresenceDelegateHelper(t, args)
+				if err == nil || !strings.Contains(stderr, tc.want) || strings.Contains(stdout, `"forwarded":true`) {
+					t.Fatalf("err=%v stdout=%q stderr=%q", err, stdout, stderr)
+				}
+				if strings.Contains(stderr, "store is locked") || strings.Contains(stderr, "not authenticated") {
+					t.Fatalf("validation ran after opening the store: %q", stderr)
+				}
+				if n := dispatched.Load(); n != 0 {
+					t.Fatalf("refused forward dispatched %d times", n)
+				}
+			})
+		}
+	}
+}
+
+// Forward runs in the sync owner, whose stderr is a log: warmup failures name
+// the recipient's role, never its phone number. send text keeps its message.
+func TestForwardWarmupWarningsOmitTheRecipient(t *testing.T) {
+	a := newForwardTestApp(t)
+	a.client.warmupErr = errors.New("usync failed")
+	var err error
+	stderr := captureRootStderr(t, func() {
+		_, err = executeDelegatedForward(t.Context(), a, forwardRequest("TEXT", "+1 (555) 222-3333"))
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stderr, "registration warmup for the forward recipient failed") || !strings.Contains(stderr, "send warmup for the forward recipient failed") {
+		t.Fatalf("warmup warnings missing: %q", stderr)
+	}
+	if strings.Contains(stderr, "15552223333") {
+		t.Fatalf("forward warmup printed the recipient: %q", stderr)
+	}
+
+	var text bytes.Buffer
+	warmupRecipient(t.Context(), a.client, types.NewJID("15552223333", types.DefaultUserServer), &text)
+	want := "warn: send registration warmup for 15552223333@s.whatsapp.net failed (send will proceed): usync failed\n" +
+		"warn: send warmup for 15552223333@s.whatsapp.net failed (send will proceed): usync failed\n"
+	if text.String() != want {
+		t.Fatalf("send text warmup output changed:\n got %q\nwant %q", text.String(), want)
 	}
 }
