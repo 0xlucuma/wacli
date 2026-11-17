@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Messages/groups: `messages forward` (kind `forward`) and `groups create` (kind `group_create`) delegate to the running sync owner when the store is locked, with the same JSON as the standalone path. Forward is a paced send in the send queue; create stays outside it, runs once and is never retried after dispatch, so a lost reply is reported as "may exist".
 - Profile: `profile business get` reads the full WhatsApp Business profile (description, websites, hours, categories) and `profile business set` updates description, address, email, websites and weekly hours with WhatsApp Web's delta mutation, validating WhatsApp's limits first. Both delegate to the running `wacli sync` through the send socket (kinds `business_profile_get`, `business_profile_set`) and stay outside the message-send queue. `catalog list` reads a business catalog page (id, name, price, sale price, currency, images, hidden, review status) with the public HTTPS query WhatsApp Web uses, since WhatsApp no longer answers the `w:biz:catalog` IQ; it needs no session and works with `--read-only`.
 - SQLite errors: preserve the JSON error string and add `sqlite_error` with primary/extended codes, symbolic name and read-only retryability (also in lifecycle errors). Only known read-only WAL init failures 264/1288 can be retryable; other errors and mutations stay non-retryable.
 - Read-only store: include `SQLITE_READONLY_CANTINIT` (1288) in the existing four-attempt read retry. Retry the entire rolled-back read view, never writable connections or mutations.
