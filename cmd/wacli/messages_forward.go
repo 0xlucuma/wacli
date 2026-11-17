@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/openclaw/wacli/internal/app"
 	"github.com/openclaw/wacli/internal/out"
 	"github.com/openclaw/wacli/internal/store"
 	"github.com/spf13/cobra"
@@ -26,6 +27,7 @@ func newMessagesForwardCmd(flags *rootFlags) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "forward",
 		Short: "Forward a stored message",
+		Long:  "Forward a stored message. Delegates to the running sync process when the store is locked.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if strings.TrimSpace(chat) == "" || strings.TrimSpace(id) == "" || strings.TrimSpace(to) == "" {
 				return fmt.Errorf("--chat, --id, and --to are required")
@@ -39,6 +41,21 @@ func newMessagesForwardCmd(flags *rootFlags) *cobra.Command {
 
 			a, lk, err := newApp(ctx, flags, true, false)
 			if err != nil {
+				resp, delegated, delegateErr := tryDelegateSend(ctx, flags, err, sendDelegateRequest{
+					Kind:           forwardKind,
+					Chat:           chat,
+					ID:             id,
+					To:             to,
+					Pick:           pick,
+					PostSendWaitMS: durationMillis(postSendWait),
+				})
+				if delegated {
+					if delegateErr != nil {
+						return delegateErr
+					}
+					warnSendStoreFailureMsg(os.Stderr, resp.ID, resp.StoreWarning)
+					return writeForwardResult(flags, resp.To, resp.ID, resp.Source, resp.StoreWarning)
+				}
 				return err
 			}
 			defer closeApp(a, lk)
@@ -46,89 +63,22 @@ func newMessagesForwardCmd(flags *rootFlags) *cobra.Command {
 			if err := a.EnsureAuthed(ctx); err != nil {
 				return err
 			}
-			source, _, err := loadMessageMutationTarget(ctx, a, chat, id)
+			plan, err := prepareForward(ctx, a, chat, id, to, pick, flags.asJSON)
 			if err != nil {
 				return err
-			}
-			if err := validateMessageCanForward(source); err != nil {
-				return err
-			}
-			var mediaInfo *store.MediaDownloadInfo
-			if strings.TrimSpace(source.MediaType) != "" {
-				info, err := a.DB().GetMediaDownloadInfo(source.ChatJID, source.MsgID)
-				if err != nil {
-					return err
-				}
-				mediaInfo = &info
-			}
-			toJID, err := resolveRecipient(a, to, recipientOptions{pick: pick, asJSON: flags.asJSON})
-			if err != nil {
-				return err
-			}
-			if mediaInfo != nil && toJID.Server == types.NewsletterServer {
-				return fmt.Errorf("media forwarding to channels is not supported")
 			}
 			if err := a.Connect(ctx, false, nil); err != nil {
 				return err
 			}
-			toJID = warmupRecipient(ctx, a.WA(), toJID, os.Stderr)
-			if err := warnRapidSendIfNeeded(a.StoreDir(), time.Now().UTC(), os.Stderr); err != nil {
-				return err
-			}
-			payload, err := buildForwardedMessage(source, mediaInfo)
+			sent, err := sendForward(ctx, a, plan)
 			if err != nil {
 				return err
 			}
-			sentID, err := runSendOperation(ctx, reconnectForSend(a), func(ctx context.Context) (types.MessageID, error) {
-				return a.WA().SendProtoMessage(ctx, toJID, payload.Message)
-			})
-			if err != nil {
-				return err
-			}
-
-			now := time.Now().UTC()
-			chatName := a.WA().ResolveChatName(ctx, toJID, "")
-			var storeErr error
-			if err := a.DB().UpsertChat(toJID.String(), chatKindFromJID(toJID), chatName, now); err != nil {
-				storeErr = fmt.Errorf("chat update: %w", err)
-			}
-			if err := a.DB().UpsertMessage(store.UpsertMessageParams{
-				ChatJID:         toJID.String(),
-				ChatName:        chatName,
-				MsgID:           string(sentID),
-				SenderName:      "me",
-				Timestamp:       now,
-				FromMe:          true,
-				Text:            payload.Text,
-				DisplayText:     payload.Text,
-				MediaType:       payload.MediaType,
-				MediaCaption:    payload.MediaCaption,
-				Filename:        payload.Filename,
-				MimeType:        payload.MimeType,
-				DirectPath:      payload.DirectPath,
-				MediaKey:        payload.MediaKey,
-				FileSHA256:      payload.FileSHA256,
-				FileEncSHA256:   payload.FileEncSHA256,
-				FileLength:      payload.FileLength,
-				IsForwarded:     true,
-				ForwardingScore: payload.ForwardingScore,
-			}); err != nil {
-				storeErr = errors.Join(storeErr, fmt.Errorf("message update: %w", err))
-			}
-			warnSendStoreFailure(os.Stderr, string(sentID), storeErr)
+			warnSendStoreFailure(os.Stderr, sent.id, sent.storeErr)
 
 			waitForPostSendRetryReceipts(ctx, postSendWait)
 
-			if flags.asJSON {
-				return out.WriteJSON(os.Stdout, addStoreWarning(map[string]any{
-					"forwarded": true,
-					"to":        toJID.String(),
-					"id":        sentID,
-					"source":    source.MsgID,
-				}, storeErr))
-			}
-			fmt.Fprintf(os.Stdout, "Forwarded message %s to %s (id %s)\n", source.MsgID, toJID.String(), sentID)
-			return nil
+			return writeForwardResult(flags, sent.to.String(), sent.id, plan.source.MsgID, sent.storeWarning())
 		},
 	}
 	cmd.Flags().StringVar(&chat, "chat", "", "source chat JID or phone number")
@@ -137,6 +87,131 @@ func newMessagesForwardCmd(flags *rootFlags) *cobra.Command {
 	cmd.Flags().IntVar(&pick, "pick", 0, "when --to is ambiguous, pick the Nth match (1-indexed)")
 	cmd.Flags().DurationVar(&postSendWait, "post-send-wait", postSendRetryReceiptWait, "keep the connection alive after forward so retry receipts can be handled (0 disables)")
 	return cmd
+}
+
+const forwardKind = "forward"
+
+// forwardApp is what the standalone command and the sync owner share to
+// forward a stored message.
+type forwardApp interface {
+	messageChatApp
+	WA() app.WAClient
+	Connect(context.Context, bool, func(string)) error
+}
+
+type forwardPlan struct {
+	source    store.Message
+	mediaInfo *store.MediaDownloadInfo
+	to        types.JID
+}
+
+type forwardOutcome struct {
+	to       types.JID
+	id       string
+	storeErr error
+}
+
+func (o forwardOutcome) storeWarning() string {
+	if o.storeErr == nil {
+		return ""
+	}
+	return o.storeErr.Error()
+}
+
+// prepareForward reads and validates the source message and recipient from
+// the local store. It never touches the network.
+func prepareForward(ctx context.Context, a messageChatApp, chat, id, to string, pick int, asJSON bool) (forwardPlan, error) {
+	source, _, err := loadMessageMutationTarget(ctx, a, chat, id)
+	if err != nil {
+		return forwardPlan{}, err
+	}
+	if err := validateMessageCanForward(source); err != nil {
+		return forwardPlan{}, err
+	}
+	var mediaInfo *store.MediaDownloadInfo
+	if strings.TrimSpace(source.MediaType) != "" {
+		info, err := a.DB().GetMediaDownloadInfo(source.ChatJID, source.MsgID)
+		if err != nil {
+			return forwardPlan{}, err
+		}
+		mediaInfo = &info
+	}
+	toJID, err := resolveRecipient(a, to, recipientOptions{pick: pick, asJSON: asJSON})
+	if err != nil {
+		return forwardPlan{}, err
+	}
+	if mediaInfo != nil && toJID.Server == types.NewsletterServer {
+		return forwardPlan{}, fmt.Errorf("media forwarding to channels is not supported")
+	}
+	return forwardPlan{source: source, mediaInfo: mediaInfo, to: toJID}, nil
+}
+
+// sendForward sends a prepared forward on a connected client and records the
+// outgoing copy. A local history failure is returned as storeErr, not as an
+// error: the message was already delivered.
+func sendForward(ctx context.Context, a forwardApp, plan forwardPlan) (forwardOutcome, error) {
+	toJID := warmupRecipient(ctx, a.WA(), plan.to, os.Stderr)
+	if err := warnRapidSendIfNeeded(a.StoreDir(), time.Now().UTC(), os.Stderr); err != nil {
+		return forwardOutcome{}, err
+	}
+	payload, err := buildForwardedMessage(plan.source, plan.mediaInfo)
+	if err != nil {
+		return forwardOutcome{}, err
+	}
+	sentID, err := runSendOperation(ctx, reconnectForSend(a), func(ctx context.Context) (types.MessageID, error) {
+		return a.WA().SendProtoMessage(ctx, toJID, payload.Message)
+	})
+	if err != nil {
+		return forwardOutcome{}, err
+	}
+
+	now := time.Now().UTC()
+	chatName := a.WA().ResolveChatName(ctx, toJID, "")
+	var storeErr error
+	if err := a.DB().UpsertChat(toJID.String(), chatKindFromJID(toJID), chatName, now); err != nil {
+		storeErr = fmt.Errorf("chat update: %w", err)
+	}
+	if err := a.DB().UpsertMessage(store.UpsertMessageParams{
+		ChatJID:         toJID.String(),
+		ChatName:        chatName,
+		MsgID:           string(sentID),
+		SenderName:      "me",
+		Timestamp:       now,
+		FromMe:          true,
+		Text:            payload.Text,
+		DisplayText:     payload.Text,
+		MediaType:       payload.MediaType,
+		MediaCaption:    payload.MediaCaption,
+		Filename:        payload.Filename,
+		MimeType:        payload.MimeType,
+		DirectPath:      payload.DirectPath,
+		MediaKey:        payload.MediaKey,
+		FileSHA256:      payload.FileSHA256,
+		FileEncSHA256:   payload.FileEncSHA256,
+		FileLength:      payload.FileLength,
+		IsForwarded:     true,
+		ForwardingScore: payload.ForwardingScore,
+	}); err != nil {
+		storeErr = errors.Join(storeErr, fmt.Errorf("message update: %w", err))
+	}
+	return forwardOutcome{to: toJID, id: string(sentID), storeErr: storeErr}, nil
+}
+
+func writeForwardResult(flags *rootFlags, to, id, source, storeWarning string) error {
+	if flags.asJSON {
+		body := map[string]any{
+			"forwarded": true,
+			"to":        to,
+			"id":        id,
+			"source":    source,
+		}
+		if storeWarning != "" {
+			body["store_warning"] = storeWarning
+		}
+		return out.WriteJSON(os.Stdout, body)
+	}
+	fmt.Fprintf(os.Stdout, "Forwarded message %s to %s (id %s)\n", source, to, id)
+	return nil
 }
 
 func validateMessageCanForward(msg store.Message) error {
