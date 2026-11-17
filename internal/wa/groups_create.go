@@ -52,15 +52,27 @@ func createGroupNoReplay(ctx context.Context, cli *whatsmeow.Client, req whatsme
 // explicit WhatsApp refusal, or a frame that never left this device) and
 // marks every other failure as unconfirmed.
 func groupCreateOutcome(err error) error {
-	var iqErr *whatsmeow.IQError
 	switch {
-	case errors.As(err, &iqErr),
+	case isExplicitIQRefusal(err),
 		errors.Is(err, whatsmeow.ErrNotConnected),
 		errors.Is(err, whatsmeow.ErrClientIsNil),
 		errors.Is(err, socket.ErrSocketClosed):
 		return err
 	}
 	return fmt.Errorf("%w: %w", ErrGroupCreateUnconfirmed, err)
+}
+
+// isExplicitIQRefusal reports an actual <iq type="error"> stanza carrying an
+// <error> with a code. sendIQ also returns *IQError for any other reply to the
+// request ID (an <ack>, an iq of another type), which proves nothing about
+// whether the group was created.
+func isExplicitIQRefusal(err error) bool {
+	var iqErr *whatsmeow.IQError
+	if !errors.As(err, &iqErr) || iqErr.RawNode == nil || iqErr.ErrorNode == nil || iqErr.Code == 0 {
+		return false
+	}
+	iqType, _ := iqErr.RawNode.Attrs["type"].(string)
+	return iqErr.RawNode.Tag == "iq" && iqType == "error"
 }
 
 // buildCreateGroupNode is whatsmeow's CreateGroup request body (group.go in
