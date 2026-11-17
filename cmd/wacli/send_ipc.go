@@ -643,7 +643,10 @@ func executeDelegatedForward(ctx context.Context, a forwardApp, req sendDelegate
 	if strings.TrimSpace(req.Chat) == "" || strings.TrimSpace(req.ID) == "" || strings.TrimSpace(req.To) == "" {
 		return sendDelegateResponse{}, fmt.Errorf("--chat, --id, and --to are required")
 	}
-	plan, err := prepareForward(ctx, a, req.Chat, req.ID, req.To, req.Pick, true)
+	if req.Pick != 0 {
+		return sendDelegateResponse{}, errForwardPick
+	}
+	plan, err := prepareForward(ctx, a, req.Chat, req.ID, req.To)
 	if err != nil {
 		return sendDelegateResponse{}, err
 	}

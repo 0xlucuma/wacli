@@ -80,7 +80,7 @@ func newGroupsCreateCmd(flags *rootFlags) *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&name, "name", "", "group name")
-	cmd.Flags().StringSliceVar(&users, "user", nil, "initial participant phone number (+E164 and formatting ok) or JID (repeatable)")
+	cmd.Flags().StringSliceVar(&users, "user", nil, "initial participant phone number (+E164 and formatting ok) or JID (repeatable, 1-50, duplicates dropped)")
 	cmd.Flags().BoolVar(&announceOnly, "announce-only", false, "only admins can send messages")
 	cmd.Flags().BoolVar(&locked, "locked", false, "only admins can edit group info")
 	cmd.Flags().BoolVar(&joinApproval, "join-approval", false, "require admin approval for new join requests")
@@ -115,7 +115,7 @@ func parseGroupCreateRequest(req groupCreateRequest) (wa.CreateGroupRequest, err
 	if req.Community && strings.TrimSpace(req.LinkedParent) != "" {
 		return wa.CreateGroupRequest{}, fmt.Errorf("--community and --linked-parent cannot be combined")
 	}
-	participants, err := parseGroupUserJIDs(req.Users)
+	participants, err := parseGroupCreateParticipants(req.Users)
 	if err != nil {
 		return wa.CreateGroupRequest{}, err
 	}
@@ -135,6 +135,37 @@ func parseGroupCreateRequest(req groupCreateRequest) (wa.CreateGroupRequest, err
 		IsParent:               req.Community,
 		LinkedParentJID:        parentJID,
 	}, nil
+}
+
+// maxGroupCreateParticipants matches the gateway's POST /groups limit.
+const maxGroupCreateParticipants = 50
+
+// parseGroupCreateParticipants requires 1–50 distinct participants. Adding
+// customers' numbers to new groups can restrict a line, so the list is never
+// unbounded. The "invalid user" prefix is what callers classify as bad input;
+// the text names counts, never numbers.
+func parseGroupCreateParticipants(users []string) ([]types.JID, error) {
+	if len(users) == 0 {
+		return nil, fmt.Errorf("invalid user list: at least one --user is required")
+	}
+	parsed, err := parseGroupUserJIDs(users)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[types.JID]bool, len(parsed))
+	participants := parsed[:0]
+	for _, jid := range parsed {
+		key := jid.ToNonAD()
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		participants = append(participants, jid)
+	}
+	if len(participants) > maxGroupCreateParticipants {
+		return nil, fmt.Errorf("invalid user list: at most %d participants per group, got %d", maxGroupCreateParticipants, len(participants))
+	}
+	return participants, nil
 }
 
 // executeGroupCreate makes exactly one CreateGroup call. Creating a group is

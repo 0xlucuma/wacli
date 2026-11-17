@@ -186,7 +186,9 @@ func TestGroupCreateValidationHappensBeforeDispatch(t *testing.T) {
 		{"blank name", []string{"groups", "create", "--name", "  "}, "--name is required"},
 		{"community and parent", []string{"groups", "create", "--name", "x", "--community", "--linked-parent", "120363000000000999@g.us"}, "--community and --linked-parent cannot be combined"},
 		{"bad user", []string{"groups", "create", "--name", "x", "--user", "not-a-phone"}, "invalid phone number"},
-		{"bad parent", []string{"groups", "create", "--name", "x", "--linked-parent", "123@s.whatsapp.net"}, "parse --linked-parent"},
+		{"bad parent", []string{"groups", "create", "--name", "x", "--user", "+12345678900", "--linked-parent", "123@s.whatsapp.net"}, "parse --linked-parent"},
+		{"no users", []string{"groups", "create", "--name", "x"}, "invalid user list: at least one --user is required"},
+		{"too many users", append([]string{"groups", "create", "--name", "x"}, groupCreateUserArgs(51)...), "invalid user list: at most 50 participants per group, got 51"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -210,7 +212,7 @@ func TestGroupCreateValidationHappensBeforeDispatch(t *testing.T) {
 
 			// The owner validates again; nothing invalid reaches WhatsApp.
 			client := &fakeGroupCreateClient{}
-			create := groupCreateRequest{Name: "x"}
+			create := groupCreateRequest{Name: "x", Users: []string{"+12345678900"}}
 			switch tc.name {
 			case "no name":
 				create.Name = ""
@@ -222,6 +224,10 @@ func TestGroupCreateValidationHappensBeforeDispatch(t *testing.T) {
 				create.Users = []string{"not-a-phone"}
 			case "bad parent":
 				create.LinkedParent = "123@s.whatsapp.net"
+			case "no users":
+				create.Users = nil
+			case "too many users":
+				create.Users = groupCreatePhones(51)
 			}
 			if _, err := executeGroupCreate(t.Context(), nil, client, create); err == nil || !strings.Contains(err.Error(), tc.want) || client.calls != 0 {
 				t.Fatalf("owner accepted invalid create: err=%v calls=%d", err, client.calls)
@@ -472,5 +478,59 @@ func TestGroupCreateReplyWithoutGroupIsUnknown(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func groupCreatePhones(n int) []string {
+	phones := make([]string, n)
+	for i := range phones {
+		phones[i] = fmt.Sprintf("+1555000%04d", i)
+	}
+	return phones
+}
+
+func groupCreateUserArgs(n int) []string {
+	var args []string
+	for _, phone := range groupCreatePhones(n) {
+		args = append(args, "--user", phone)
+	}
+	return args
+}
+
+func TestGroupCreateParticipantsAreDistinctAndBounded(t *testing.T) {
+	// One person written four ways, plus a LID twice: two participants, in
+	// first-seen order.
+	got, err := parseGroupCreateParticipants([]string{"+1 (234) 567-8900", "222@lid", "12345678900@s.whatsapp.net", "12345678900:3@s.whatsapp.net", "1-234-567-8900", "222@lid"})
+	want := []types.JID{types.NewJID("12345678900", types.DefaultUserServer), types.NewJID("222", types.HiddenUserServer)}
+	if err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("participants = %v, %v; want %v", got, err, want)
+	}
+
+	if got, err := parseGroupCreateParticipants(groupCreatePhones(maxGroupCreateParticipants)); err != nil || len(got) != 50 {
+		t.Fatalf("50 distinct participants refused: %d, %v", len(got), err)
+	}
+	// The cap counts distinct people: 60 entries naming 50 people pass.
+	if got, err := parseGroupCreateParticipants(append(groupCreatePhones(50), groupCreatePhones(10)...)); err != nil || len(got) != 50 {
+		t.Fatalf("duplicates counted against the cap: %d, %v", len(got), err)
+	}
+	for _, users := range [][]string{nil, {}, groupCreatePhones(51)} {
+		_, err := parseGroupCreateParticipants(users)
+		if err == nil || !strings.HasPrefix(err.Error(), "invalid user list: ") {
+			t.Fatalf("%d users -> %v", len(users), err)
+		}
+		if strings.Contains(err.Error(), "+1555") || strings.Contains(err.Error(), "@") {
+			t.Fatalf("error carries a number: %v", err)
+		}
+	}
+
+	// The owner sends the de-duplicated list, once.
+	client := &fakeGroupCreateClient{info: groupCreateTestInfo()}
+	req := groupCreateTestRequest()
+	req.Users = append(req.Users, "12345678900@s.whatsapp.net", "222@lid")
+	if _, err := executeGroupCreate(t.Context(), openGroupCreateTestDB(t), client, req); err != nil {
+		t.Fatal(err)
+	}
+	if client.calls != 1 || len(client.req.Participants) != 2 {
+		t.Fatalf("calls=%d participants=%v", client.calls, client.req.Participants)
 	}
 }

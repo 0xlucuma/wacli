@@ -76,7 +76,8 @@ func isExplicitIQRefusal(err error) bool {
 }
 
 // buildCreateGroupNode is whatsmeow's CreateGroup request body (group.go in
-// both pinned SDKs), node for node.
+// both pinned SDKs), node for node. Its errors name participants by position,
+// not JID, so phone numbers stay out of logs.
 func buildCreateGroupNode(ctx context.Context, cli *whatsmeow.Client, req whatsmeow.ReqCreateGroup) (waBinary.Node, error) {
 	participantNodes := make([]waBinary.Node, len(req.Participants), len(req.Participants)+1)
 	participantNodes = append(participantNodes, waBinary.Node{
@@ -90,7 +91,7 @@ func buildCreateGroupNode(ctx context.Context, cli *whatsmeow.Client, req whatsm
 			var err error
 			participantPN, err = cli.Store.LIDs.GetPNForLID(ctx, participant)
 			if err != nil {
-				return waBinary.Node{}, fmt.Errorf("failed to get phone number for participant %s: %v", participant, err)
+				return waBinary.Node{}, fmt.Errorf("failed to get phone number for participant %d of %d: %v", i+1, len(req.Participants), err)
 			}
 		}
 		participantAttrs := waBinary.Attrs{"jid": participant}
@@ -103,7 +104,7 @@ func buildCreateGroupNode(ctx context.Context, cli *whatsmeow.Client, req whatsm
 		}
 		token, err := cli.DangerousInternals().EnsureTCToken(ctx, participant)
 		if err != nil {
-			return waBinary.Node{}, fmt.Errorf("failed to get privacy token for participant %s: %v", participant, err)
+			return waBinary.Node{}, fmt.Errorf("failed to get privacy token for participant %d of %d: %v", i+1, len(req.Participants), err)
 		} else if len(token) > 0 {
 			participantNodes[i].Content = []waBinary.Node{{
 				Tag:     "privacy",
