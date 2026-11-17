@@ -51,6 +51,7 @@ const (
 	createDropConnection createReply = iota // accept the frame, never answer, close the socket
 	createAnswerGroup
 	createAnswerRefusal
+	createAnswerAck // an <ack> with the create's ID: neither a result nor an IQ error
 )
 
 type recordedCreate struct {
@@ -227,6 +228,8 @@ func (s *fakeWAServer) serve(w http.ResponseWriter, r *http.Request) {
 				return
 			case createAnswerGroup:
 				_ = send(createdGroupAnswer(id))
+			case createAnswerAck:
+				_ = send(waBinary.Node{Tag: "ack", Attrs: waBinary.Attrs{"id": id, "from": types.GroupServerJID}})
 			case createAnswerRefusal:
 				_ = send(waBinary.Node{Tag: "iq", Attrs: waBinary.Attrs{"id": id, "type": "error", "from": types.GroupServerJID}, Content: []waBinary.Node{
 					{Tag: "error", Attrs: waBinary.Attrs{"code": "406", "text": "not-acceptable"}},
@@ -609,12 +612,54 @@ func TestCreateGroupRefusalStaysARefusal(t *testing.T) {
 	}
 }
 
+// A reply to the create's ID that is not an IQ error stanza is accepted by
+// the SDK's response waiter and surfaces as *IQError, but it does not say the
+// group was not created.
+func TestCreateGroupUnexpectedReplyIsUnconfirmed(t *testing.T) {
+	server := newFakeWAServer(t, func(int) createReply { return createAnswerAck })
+	cli := connectToFakeServer(t, server)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	info, err := (&Client{client: cli}).CreateGroup(ctx, testCreateRequest())
+	var iqErr *whatsmeow.IQError
+	if info != nil || !errors.Is(err, ErrGroupCreateUnconfirmed) || !strings.Contains(err.Error(), "may still have gone through") {
+		t.Fatalf("unexpected reply must be unconfirmed, got info=%v err=%v", info, err)
+	}
+	if !errors.As(err, &iqErr) || iqErr.Code != 0 || iqErr.RawNode == nil || iqErr.RawNode.Tag != "ack" {
+		t.Fatalf("cause lost: %#v", err)
+	}
+	if _, creates := server.snapshot(); len(creates) != 1 {
+		t.Fatalf("create frames = %d", len(creates))
+	}
+}
+
+// iqErrorFor builds the error the SDK's sendIQ returns for a reply node.
+func iqErrorFor(reply waBinary.Node) *whatsmeow.IQError {
+	iqErr := &whatsmeow.IQError{RawNode: &reply}
+	if errNode, ok := reply.GetOptionalChildByTag("error"); ok {
+		iqErr.ErrorNode = &errNode
+		ag := errNode.AttrGetter()
+		iqErr.Code = ag.OptionalInt("code")
+		iqErr.Text = ag.OptionalString("text")
+	}
+	return iqErr
+}
+
 func TestGroupCreateOutcomeClassification(t *testing.T) {
+	errorIQ := func(attrs waBinary.Attrs) waBinary.Node {
+		return waBinary.Node{Tag: "iq", Attrs: waBinary.Attrs{"id": "1", "type": "error"}, Content: []waBinary.Node{{Tag: "error", Attrs: attrs}}}
+	}
 	for _, tc := range []struct {
 		err       error
 		uncertain bool
 	}{
-		{&whatsmeow.IQError{Code: 406, Text: "not-acceptable"}, false},
+		{iqErrorFor(errorIQ(waBinary.Attrs{"code": "406", "text": "not-acceptable"})), false},
+		{fmt.Errorf("wrapped: %w", iqErrorFor(errorIQ(waBinary.Attrs{"code": "403", "text": "forbidden"}))), false},
+		{iqErrorFor(errorIQ(waBinary.Attrs{"text": "no code"})), true},
+		{iqErrorFor(waBinary.Node{Tag: "iq", Attrs: waBinary.Attrs{"id": "1", "type": "error"}}), true},
+		{iqErrorFor(waBinary.Node{Tag: "ack", Attrs: waBinary.Attrs{"id": "1"}}), true},
+		{iqErrorFor(waBinary.Node{Tag: "iq", Attrs: waBinary.Attrs{"id": "1", "type": "get"}}), true},
+		{&whatsmeow.IQError{Code: 406, Text: "no stanza"}, true},
 		{whatsmeow.ErrNotConnected, false},
 		{whatsmeow.ErrClientIsNil, false},
 		{fmt.Errorf("send: %w", socket.ErrSocketClosed), false},
